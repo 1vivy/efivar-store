@@ -1,6 +1,6 @@
 # efivar-store
 
-**Status (2026-10-07)** — EFVS v1 is the live block-backed EFI variable container:
+**Status (2026-10-08)** — EFVS v1 is the live block-backed EFI variable container:
 A/B checkpoints plus a hash-chained append log, with shared allocation-free `no_std`
 serializers and replay for firmware and Linux. The existing edk2 FV engine remains
 unchanged for import/export, inspection and migration of existing stores.
@@ -18,8 +18,9 @@ The 1 MiB phone profile reserves two 128 KiB checkpoint slots and a 778240-byte 
    This is a library linked into an application, **not a standalone runtime DXE image**.
 2. **Storage engine** (`crates/efivar-store`): the EFVS v1 container ([spec](docs/efvs-v1.md)),
    the edk2 NV engine for interoperability and migration, and the pure `auth` rules.
-3. **[Linux backend](docs/linux.md)** (`linux/`): a Rust-for-Linux efivars backend module that
-   serves the kernel's own efivarfs.
+3. **[Linux backend](docs/linux.md)** (`linux/`): a C-glue efivars module linking the
+   allocation-free Rust engine through `crates/efivar-store-ffi`. It serves the kernel's
+   own efivarfs without kernel Rust crates or Rust-mangled imports.
 4. **CLI** (`cli`): inspect and edit image files and caller-selected block devices.
 
 The official Secure Boot policy is **None**: no root keys, SecureBoot=0, tier 0.

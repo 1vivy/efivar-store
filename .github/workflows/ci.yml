@@ -29,12 +29,13 @@ jobs:
         run: cargo test --locked
       - name: Check the core builds for a bare target
         run: cargo build --locked -p efivar-store --no-default-features --target thumbv7em-none-eabihf
-  kernel-core:
+  kernel-ffi:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.82.0"
-      - name: Compile the source embedding used by the GKI Rust module
-        run: rustc --edition=2021 --crate-type=lib -D warnings crates/efivar-store/compat/kernel-source.rs -o /tmp/libkernel_source.rlib
+          toolchain: nightly-2026-08-08
+          components: rust-src
+      - name: Build the freestanding Linux engine
+        run: RUSTFLAGS="-Z unstable-options -C relocation-model=static -C panic=immediate-abort -C force-unwind-tables=no -C embed-bitcode=no" cargo build --locked -Z build-std=core,compiler_builtins --release -p efivar-store-ffi --no-default-features --target aarch64-unknown-none-softfloat

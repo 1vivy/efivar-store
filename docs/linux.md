@@ -1,84 +1,182 @@
-# Linux Rust efivars backend
+# Linux C-glue efivars backend
 
-`linux/efivar_store.rs` is an out-of-tree Rust-for-Linux module, not a filesystem or C ABI crate. It embeds the allocation-free engine directly. `StoreBackend` loads EFVS v1, replays read-only into an owned in-kernel list and never compacts: compaction belongs exclusively to firmware. Writes pass the shared structural, boot-services-only-name, attribute, policy and authentication/timestamp checks, append exactly one checked record, flush, then publish the new list entry. Log exhaustion returns EFI_OUT_OF_RESOURCES. I/O failure reloads the durable view, disabling operations if reload fails.
+`linux/efivar_store.c` is an out-of-tree C module linked with the audited,
+allocation-free Rust EFVS engine through `crates/efivar-store-ffi`. It is not a
+filesystem: it supplies the kernel's own efivarfs backend. No kernel Rust crate,
+Rust metadata, bindgen, or `CONFIG_RUST` is required. The engine's public API and
+EFVS on-disk format are unchanged.
 
-The shipped verifier is **PolicyNone**: authenticated attributes and secure-boot enrollment return EFI_SECURITY_VIOLATION, not successful deferred enrollment. The shared timestamp rule applies before a verifier could accept an authenticated write; no cryptographic verifier is shipped. Boot-services-only names/variables and firmware policy variables return EFI_WRITE_PROTECTED. Nonblocking SetVariable is NULL. QueryVariableInfo reports log capacity/free bytes and the checkpoint-bound maximum variable size.
+## State and durability
 
-Discovery accepts mutually exclusive `dev=major:minor` or `partuuid=<unique-GPT-UUID>` parameters. UUID lookup iterates live block-class partitions and matches `bd_meta_info.uuid`, never calling discarded `__init` lookup functions. Without parameters it reads the string `/chosen/efivar-store,partuuid` from the device tree. Android/GBL has no EFI system table, so esu supplies `dev`. Native binding on the EFVS EFI configuration-table GUID is the **in-tree upstreaming route**, not available to this external module: ACK's boot-only parser discards unknown GUIDs and releases the original table arrays. It requires adding the GUID to `efi_config_parse_tables`' recognized table list and retaining the decoded descriptor; scanning reclaimable firmware boot memory at module load is unsound.
+C allocates the image (1 MiB for the phone profile, bounded at 16 MiB), checkpoint
+scratch, and aligned opaque context. The FFI context borrows these buffers;
+`efvs_ctx_size()` describes its size. The callbacks allocate nothing and share
+one kernel mutex. Names cross the boundary as UTF-16LE bytes without a terminator,
+and GUIDs as 16 EFI wire-order bytes. Borrowed get/next views remain valid only
+until the next set or load; C consumes them while holding the mutex.
 
-Registration follows `tee_stmm_efi`: unregister generic runtime operations, register ours, restore generic operations on failure/remove. Other backends are not evicted. `Mutex<Option<State>>` owns all state; unload excludes callbacks before dropping it. Do not unload with efivarfs mounted.
+`efvs_load` replays read-only under **PolicyNone**, including filtering imported
+checkpoint variables. `efvs_set` validates and appends exactly one record to the
+memory image/state, returning its changed byte range. While still holding the
+mutex, C performs `kernel_write`, `vfs_fsync`, then chunked readback verification
+of exactly that range. Only then can another reader observe the new state. I/O
+failure rereads the durable image and replays it; failed reload disables all
+callbacks. Linux never formats, imports or compacts. Firmware alone initializes
+blank partitions and compacts exhausted or torn logs.
 
-Blank/unformatted partitions are refused at probe with a clear error and **no writes**. Firmware initializes blank partitions on first boot; the Linux module never formats, imports or compacts storage.
-
-## Feasibility evidence
-
-Paths below are relative to `/home/vivy/Projects/efisp-projects` unless stated otherwise. No phone commands were issued for this work.
-
-| Fact | Observed value | Evidence |
-| --- | --- | --- |
-| Phone kernel | 6.12.58-android16-6-g925a103d123c-ab15898589-4k | `gobbl-lab/records/20261006T040000Z-phone-recovery-reads/evidence/02-uname--a.stdout` |
-| Matching ACK source | android16-6.12, 925a103d123c30a84577f29e1573376aacbde94b, KMI generation 6 | `.work/thinpool-proof/.work/phone-common` |
-| Captured configuration | CONFIG_RUST=y; CONFIG_ANDROID_BINDER_IPC_RUST=m; CONFIG_EFI=y; CONFIG_EFIVAR_FS unset; CONFIG_MODVERSIONS=y | `.work/thinpool-proof/.work/phone-live.config` (saved capture, not the lab's config.gz-presence listing) |
-| Phone Rust compiler | rustc 1.82.0-dev f6e511eec, Android linux-15123656 | same saved configuration, CONFIG_RUSTC_VERSION_TEXT |
-| Phone bindgen | 0.69.5 | same saved configuration, CONFIG_BINDGEN_VERSION_TEXT |
-| Tested build output | Rust=y, Binder Rust=m, EFI=y, EFIVAR_FS unset, MODVERSIONS=y, TRIM_UNUSED_KSYMS=y | `.work/thinpool-proof/.work/gki-out/.config` |
-| Tested Rust metadata | libkernel/libcore/libbindings/libuapi/libffi/libcompiler_builtins/libbuild_error .rmeta, libmacros.so, generated bindings present | `gki-out/rust/` |
-| Tested metadata compiler | upstream rustc 1.82.0, LLVM 19.1.1 | gki-out configuration; installed rustup 1.82.0 compiler |
-| Exact Android compiler available | 1.82.0.p1, linux-15123656 | `.work/thinpool-proof/.work/cf-super/prebuilts/rust/linux-x86/1.82.0.p1/bin/rustc` |
-| AOSP manifest | GBL mainline, not the phone ACK kernel; its Rust prebuilts are newer | `gobbl-aosp/.repo/manifests/default.xml` |
-| Host bindgen | 0.73.2; exact 0.69.5 not located | installed bindgen; external build consumes existing generated bindings |
-| Module code generation that passed QEMU | upstream rustc 1.82.0 plus LLVM 23.1.1 tools | explicit RUSTC and LLVM arguments below |
-
-**Important toolchain finding:** Android clang/llvm-link 19.0.1 from clang-r536225 produced a linkable but invalid module when consuming upstream rustc's LLVM 19.1.1 bitcode. Prelink IR retained correct pointers; linked IR introduced `ptr undef`, and QEMU crashed in module initialization. LLVM 23.1.1 linking/code generation passed the runtime test. Do not treat a successful .ko link as proof that mixed LLVM minor releases are compatible. The exact Android compiler/output combination has not been runtime-tested.
-
-## Build and loading
-
-Supply a fully built matching kernel output, including Rust metadata, generated bindings, Module.symvers and System.map. `modules_prepare` alone does not supply these artifacts. Bindgen regeneration is unnecessary for this external module.
-
-```sh
-export PATH="$HOME/.cargo/bin:$PATH"
-export RUSTC_BOOTSTRAP=1
-make -C linux KMI_SRC=/path/to/phone-common KMI_OUT=/path/to/gki-out \
-  RUSTC="$HOME/.rustup/toolchains/1.82.0-x86_64-unknown-linux-gnu/bin/rustc" \
-  LLVM=/usr/bin/
-modinfo linux/efivar_store.ko
-```
-
-The tested vermagic is `6.12.58-4k-g925a103d123c SMP preempt mod_unload modversions aarch64`. This is the scratch rebuilt ACK release, not the captured production phone's complete release string.
-
-Generic kernels with appropriate exported symbols can use ordinary insmod/modprobe. This Android GKI output trims some exports and protects others: ordinary insmod failed with protected-symbol errors (-13) for kernel_read/kernel_write and Rust support functions, and unknown-symbol errors (-2) for trimmed helpers. Exact console evidence: `/var/tmp/efivar-rust-qemu-target/write.log`. Android integration therefore uses kernelesp's existing relocating loader, not plain insmod. This is not a generally KMI-export-only module.
-
-The final non-KMI imports and admission evidence are recorded below. CRC/System.map admission alone cannot detect the mixed-LLVM invalid-IR failure; the loader VM gate is required.
-
-The phone has CONFIG_EFIVAR_FS unset, so kernelesp builds the matching upstream fs/efivarfs as a separate efivarfs.ko. Keep upstream source pristine plus exactly one named patch adding esu's project GUID (`7a5e4b1c-0d3f-4e62-9b8a-1c2d3e4f5a6b`) to the removable allowlist. Without it, unknown-GUID variables are immutable and the boot HAL cannot write them without CAP_LINUX_IMMUTABLE. The Rust backend is a second module, efivar_store.ko, loaded before mounting efivarfs.
-
-## Exercised round-trip
-
-`linux/test_qemu.py` initializes an EFVS image with `efivar-store init --efvs`, uses static busybox and matching virtio modules, and boots the ACK Image for write, reboot-read, offline firmware-equivalent CLI compaction/read, and truncated-record-tail/read. With `--loader`, both EFI modules use an executable calling production `esuinit::load_module`, not a test relocation engine. The frontend loads before the backend; both load before mounting.
-
-```sh
-python3 linux/test_qemu.py --kernel-out /path/to/gki-out \
-  --backend linux/efivar_store.ko --frontend /path/to/efivarfs.ko \
-  --busybox /path/to/static-arm64-busybox --cli target/debug/efivar-store \
-  --loader /path/to/relocating-insmod --work /var/tmp/efvs-geometry-final
-```
-
-Observed PASS through the production loader: OS create/immediate read/update/delete, reboot reread, offline CLI `compact` followed by reread, a final CLI-created record with its last 16 bytes truncated/zeroed followed by reread of the earlier checkpoint, and blank-store refusal with host-confirmed byte-identical zero storage. Logs: `/var/tmp/efvs-geometry-final/{write,read,compact,torn,blank}.log`; retained image: `store.img`. A 16-KiB EFVS image with 512-byte blocks and two 4-KiB checkpoints also passed set/update/delete and reboot reread (`small-write.log`, `small-read.log`); probe reads bounded candidate headers rather than assuming a minimum 64-KiB partition. No physical phone commands were issued. UUID/DT discovery, QueryVariableInfo, EFI-present replacement, unload/restoration and injected I/O failure remain unproven at runtime.
-
-Final `scripts/kmi_modules.py::verify_module` admission: **38 versioned imports, 11 kallsyms-resolved imports, no CRC mismatches**. Final `modinfo`: name `efivar_store`, GPL, no dependencies, vermagic `6.12.58-4k-g925a103d123c SMP preempt mod_unload modversions aarch64`, parameters `dev` and `partuuid`.
-
-Exact non-KMI symbol list:
+Blank/unusable storage is refused with:
 
 ```text
-_RNvNtCshBBT4i9RzFA_4core3fmt5write
-_RNvNtNtCshBBT4i9RzFA_4core5slice5index22slice_index_order_fail
-_RNvNtNtCshBBT4i9RzFA_4core5slice5index26slice_start_index_len_fail
-_RNvNtNtCshBBT4i9RzFA_4core9panicking11panic_const24panic_const_shl_overflow
-_RNvNtNtCskPkSD4WGMmy_6kernel5print14format_strings4INFO
-_RNvNvMNtCshBBT4i9RzFA_4core5sliceSp15copy_from_slice17len_mismatch_fail
+efivar_store: no usable EFVS store; firmware must initialize blank partitions (no bytes written)
+```
+
+Probe reads bounded header candidates at zero and powers of two from 512 to
+65536, so recovery works with a torn A header and smaller-than-phone geometry.
+No probe failure writes any storage bytes.
+
+EFI status behavior is retained: exhaustion is EFI_OUT_OF_RESOURCES;
+boot-services-only variables/names and firmware policy variables are
+EFI_WRITE_PROTECTED; authenticated attributes and Secure Boot enrollment are
+EFI_SECURITY_VIOLATION. No cryptographic verifier is shipped. Nonblocking
+SetVariable and query-store are NULL. QueryVariableInfo accepts attributes 7 and
+reports log capacity/free bytes and the checkpoint-bound maximum variable size.
+
+## Discovery and registration
+
+Accept mutually exclusive `dev=major:minor` or `partuuid=<unique-GPT-UUID>`.
+Without parameters, read `/chosen/efivar-store,partuuid` from DT. UUID lookup
+iterates live `block_class` partitions and matches `bd_meta_info.uuid`
+case-insensitively, after checking canonical 36-character UUID syntax. It never
+calls discarded boot-only lookup functions. Open with
+`bdev_file_open_by_dev(dev, BLK_OPEN_READ | BLK_OPEN_WRITE, NULL, NULL)`.
+
+Registration follows `tee_stmm_efi`: unregister generic runtime operations,
+register ours, restore generic operations on registration failure or removal.
+Other registered backends are not evicted. Unregister excludes callbacks before
+freeing buffers. Do not unload with efivarfs mounted.
+
+Android/GBL has no EFI system table, so esu supplies `dev`. Native discovery via
+the EFVS EFI configuration-table GUID remains the **in-tree upstreaming route**:
+ACK's boot-only parser discards unknown GUIDs and releases the table arrays. It
+would need a recognized GUID entry in `efi_config_parse_tables` and retained
+decoded descriptor, not scanning reclaimable boot memory from an external LKM.
+
+## Freestanding build
+
+A fully built matching ACK output is required: generated C headers,
+Module.symvers, and System.map. `modules_prepare` alone is insufficient.
+
+```sh
+make -C linux KMI_SRC=/path/to/phone-common KMI_OUT=/path/to/gki-out \
+  LLVM=/usr/bin/
+```
+
+The Makefile works both through its outer target and direct ACK kbuild (including
+kernelesp's pinned-source builder). It builds the staticlib offline with pinned
+`nightly-2026-08-08`, `-Z build-std=core,compiler_builtins`, and installed `rust-src`;
+no downloaded softfloat target is needed. Override `CARGO` and `RUST_TOOLCHAIN`
+only with an equivalently supported toolchain. The target is
+`aarch64-unknown-none-softfloat`, forbidding FP/NEON. Rust code generation uses
+static relocations, one codegen unit, no embedded LLVM bitcode, and no forced
+unwind tables. Kbuild links the C object and a garbage-collected `ld -r
+--whole-archive` Rust object into one `efivar_store.ko`, retaining only the FFI
+roots and their dependencies.
+
+**Panic strategy:** the freestanding build deliberately uses
+`-Z unstable-options -C panic=immediate-abort`. Ordinary `panic=abort` still
+retains core formatting code through bounds-check/assertion message construction,
+even when the panic handler ignores its argument. Immediate abort removes that
+reachable formatting machinery. The crate has its own tiny panic handler calling
+a nonreturning C hook, but compiler-generated panics under this strategy fault
+immediately instead. An invariant failure is a kernel oops; the phone crash
+capture profile (`androidboot.init_fatal_panic=true` plus `oops=panic`) turns it
+into a panic and readable KCONSOLE dump. Host tests use the normal host panic
+strategy. No reachable Debug derivations or formatting operations are introduced
+by the FFI. The final tested module contains **zero core::fmt symbols**.
+
+C compilation and native object linking used **LLVM 23.1.1 at `/usr/bin/`**.
+ACK was built with Android clang 19.0.1, so its compiler-difference warning is
+expected. Do not use Android LLVM 19 to consume the Rust object's bitcode:
+previous mixed-minor LLVM linking produced invalid IR despite a successful link.
+This build supplies native Rust object code, not kernel Rust metadata/IR.
+
+Generic kernels with suitable exports can use insmod/modprobe. Trimmed Android
+GKI protects or omits some C exports, so kernelesp's production relocating loader
+resolves undefined symbols against kallsyms before invoking init_module. It does
+not itself apply AArch64 relocations: ACK's `arch/arm64/kernel/module.c` does.
+Successful CRC/System.map admission alone is not a runtime proof.
+
+The phone has efivarfs disabled in its kernel. Kernelesp ships matching upstream
+`fs/efivarfs` as `efivarfs.ko`, with its named patch adding project GUID
+`7a5e4b1c-0d3f-4e62-9b8a-1c2d3e4f5a6b` to the removable allowlist. Load the backend
+before mounting it; unknown GUIDs otherwise need CAP_LINUX_IMMUTABLE for deletion.
+
+## Compatibility evidence (2026-10-08)
+
+The old Rust-for-Linux implementation failed the real phone relocating loader
+because its core/kernel crate hashes differed from the phone's exports and
+`core::fmt::Formatter::pad` was absent altogether. The C-glue cutover fixes the
+ABI cause, rather than renaming imports to guessed crate hashes.
+
+Saved evidence, relative to `/home/vivy/Projects/efisp-projects`:
+
+- Failure: `gobbl-lab/records/20261008T055846Z-phone-efvs-lkm-test/efvs.json`.
+- Phone symbols: `gobbl-lab/records/20261008T055912Z-phone-efvs-kallsyms/evidence/01-kallsyms.stdout`.
+- ACK source: `.work/thinpool-proof/.work/phone-common`, android16-6.12,
+  `925a103d123c30a84577f29e1573376aacbde94b`, KMI generation 6.
+- Kernel output: `.work/thinpool-proof/.work/gki-out`.
+
+`readelf -Ws` and `llvm-nm --undefined-only` show no undefined `_RN` symbol.
+Every undefined symbol exists in the saved phone kallsyms: **missing set empty**.
+The Rust object has no unwind section and disassembly of the final module shows
+no FP/NEON instructions. KMI admission reports **24 versioned entries** (including
+module_layout) and **five kallsyms-resolved imports**, with no CRC mismatch:
+
+```text
 block_class
 efivars_generic_ops_register
 efivars_generic_ops_unregister
 efivars_register
 efivars_unregister
 ```
+
+The receipt was generated using the unmodified kernelesp verifier's
+`verify_module`, `kmi_identity`, and `provenance` functions, then admitted by:
+
+```sh
+python3 /path/to/kernelesp/scripts/kmi_modules.py verify \
+  --kmi-out /path/to/gki-out --module linux/efivar_store.ko
+```
+
+The existing kernelesp tracked SOURCE_REVISION pins the earlier implementation,
+and EFIVAR_STORE_REPO only changes the clone origin, not that revision. The
+packaged make flow therefore cannot select this branch without a pin update;
+no kernelesp tracked files were changed here.
+
+## Exercised round-trip
+
+```sh
+cargo test --locked --offline
+cargo clippy --all-targets --locked --offline -- -D warnings
+python3 linux/test_qemu.py --kernel-out /path/to/gki-out \
+  --backend linux/efivar_store.ko --frontend /path/to/efivarfs.ko \
+  --busybox /path/to/static-arm64-busybox --cli target/debug/efivar-store \
+  --loader /path/to/relocating-insmod --work /var/tmp/efvs-c-glue-accepted
+```
+
+All **76 existing tests plus three new FFI ABI tests** pass. FFI tests exercise
+changed-range preservation, create/update/append/delete/replay/iteration, policy
+precedence, query sizing, exhaustion without writes, torn-tail recovery and
+blank refusal. Clippy with warnings denied passes.
+
+`linux/test_qemu.py` uses the production `esuinit::load_module` executable, not a
+test relocation engine. Final observed output:
+
+```text
+PASS: immediate read, update, delete, reboot, firmware compaction, torn-tail reread and blank refusal without writes
+```
+
+Logs are `/var/tmp/efvs-c-glue-accepted/{write,read,compact,torn,blank}.log`.
+The blank image is host-confirmed byte-identical to its initial 1 MiB of zeroes.
+UUID/DT discovery, EFI-present generic-backend replacement and physical-device
+power cuts were not exercised. **No device commands were issued.**

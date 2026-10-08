@@ -1,5 +1,6 @@
 *.o
 *.ko
+*.ko.compat.json
 *.bc
 *.mod
 *.mod.c

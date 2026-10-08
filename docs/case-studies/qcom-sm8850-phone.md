@@ -298,16 +298,17 @@ path, not an efivarfs mount in stock Android, whose raw-Image path receives no E
 ## 6. The Linux side: the same bytes, through the kernel's own efivarfs
 
 The kernel has one variable backend, so the OS-side answer is not "a second variable service" but "the
-backend the kernel already has, over our partition". Two implementations exist in this workspace and
-they agree on the mechanism:
+backend the kernel already has, over our partition". The historical edk2 C backend below and the
+current EFVS C-glue backend agree on that mechanism; only EFVS is shipped by this repository now:
 
 - **`kernelesp/modules/efivarfs`** — the bundled ACK `efivarfs` sources (android16-6.12, KMI generation
   6, `PROVENANCE.md:1-6`) plus a 310-line C engine `bdsvars.c`: "Block-backed edk2 authenticated
   variable store. No runtime firmware calls." (`bdsvars.c:1-2`).
-- **The Rust kernel module** being built in this repository's sibling worktree, which registers the same
-  operation set through Rust-for-Linux.
+- **The current EFVS backend** (`linux/efivar_store.c`) registers the same operation
+  set through C glue linked to the audited Rust engine's freestanding static library.
+  It does not use Rust-for-Linux or import kernel Rust crates; see [the Linux guide](../linux.md).
 
-The C engine is worth reading as the reference for what "as intended" means here:
+The historical C engine illustrates the registration mechanism (its edk2 storage path is not the current EFVS implementation):
 
 - The engine is handed a resolved `major:minor` (`module_param(dev, …)`, "required bdsvars block device
   major:minor", `bdsvars.c:16-20`); partition discovery is the init's job (`bdsvars` by PARTNAME,
