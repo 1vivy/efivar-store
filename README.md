@@ -4,15 +4,27 @@
 `crates/varstore` + `tools/bdsvars`). The core engine and the Unix adapter are host-tested; the
 formatter creates a standalone NV FV, and FTW (fault-tolerant write) maintenance is not implemented.
 
-edk2-compatible EFI variable storage on a block device or partition: a `no_std`, allocation-free,
-dependency-free Rust core that validates, formats and updates edk2 NV variable images byte for byte,
-plus a CLI that inspects and edits them. The canonical use is an OVMF-style variable store on its own
-partition, written and read by firmware, a bootloader or an operating system that owns the bytes.
+UEFI variable services and edk2-compatible EFI variable storage on a block device or partition.
+The first component, **`efivar-store-uefi`**, publishes a caller-policy-controlled variable service
+over the firmware system table. The underlying **`efivar-store`** engine remains `no_std`,
+allocation-free and dependency-free; the **CLI** inspects and edits the same byte images.
+
+## Components
+
+1. **[UEFI variable service](docs/uefi.md)** (`crates/efivar-store-uefi`): `no_std` + boot-time
+   `alloc`, original-firmware forwarding, volatile overlay, durable block-backed updates, private
+   runtime table publication, CRC maintenance and frozen read-only AArch64/x86-64 runtime thunks.
+   This is a library linked into an application, **not a standalone runtime DXE image**.
+2. **Storage engine** (`crates/efivar-store`): validates, formats and updates edk2 NV images.
+3. **CLI** (`cli`): inspect and edit image files and caller-selected block devices.
 
 ## What this repository owns
 
 - **Identity**: the `(name, vendor GUID)` key — UTF-16LE names with their on-disk NUL, 16-byte EFI
   wire-order GUIDs (not UUID text order).
+- **UEFI mechanism**: GetVariable/GetNextVariableName/SetVariable/QueryVariableInfo, runtime
+  properties, runtime-code placement and ExitBootServices transition. Consumers choose the
+  namespaces, store geometry, backend, installation timing and diagnostics.
 - **Attributes**: the UEFI attribute word as stored, including the refusal of authenticated,
   time-based, enhanced-authenticated and `APPEND_WRITE` updates.
 - **Formats**: edk2's normal and authenticated variable record layouts, the `VARIABLE_STORE_HEADER`,
@@ -31,11 +43,6 @@ partition, written and read by firmware, a bootloader or an operating system tha
   selection precedence (`OneShot` > `Default` > `Selected`). Consumers own all of it.
 - **Partitioning**: partition names, sizes, GPT or LVM layout, block-device discovery, provisioning of
   the medium. The store is GUID- and size-agnostic: the caller chooses the bytes and the geometry.
-- **UEFI runtime services**: installing a `gRT` `SetVariable`/`GetVariable` implementation, the
-  `ExitBootServices` view, `EFI_RT_PROPERTIES_TABLE` reporting and the firmware side of variable
-  access are consumer work. This repository is the storage engine underneath; it never talks to
-  firmware. [docs/consumer-guide.md](docs/consumer-guide.md) collects the lifecycle rules such a
-  consumer must follow.
 
 ## Three representations
 
@@ -48,6 +55,12 @@ partition, written and read by firmware, a bootloader or an operating system tha
 The byte layouts of all three, with offsets, are in [docs/format.md](docs/format.md).
 
 ## Usage
+
+### UEFI service
+
+Use `efivar-store-uefi` from `crates/efivar-store-uefi`; supply a `BlockBackend`, namespace `Policy`,
+store size, live system table and diagnostic callback to `VariableService::install`.
+Install before starting child images. See [the lifecycle and integration contract](docs/uefi.md).
 
 ### Library
 

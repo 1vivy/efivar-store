@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["cli", "crates/efivar-store"]
+members = ["cli", "crates/efivar-store", "crates/efivar-store-uefi"]
 
 [workspace.package]
 version = "0.1.0"

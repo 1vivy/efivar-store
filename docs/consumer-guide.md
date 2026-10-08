@@ -1,9 +1,9 @@
 # Consumer guide: putting a variable store under UEFI
 
-**Status (2026-10-07)** — lifecycle rules for anyone building a UEFI variable-service consumer on top
-of this crate (a firmware runtime-service shim, a bootloader, an OS-side tool). Each rule states the
-primary source it comes from. This crate is the byte-image engine underneath; none of the rules below
-are implemented here.
+**Status (2026-10-07)** — lifecycle rules for consumers of the storage engine and the
+[`efivar-store-uefi` service library](uefi.md). The service implements publication, routing,
+boot-time persistence and the frozen EBS view; the consumer still owns policy, storage selection
+and installation timing. Each rule below cites its primary source.
 
 ## 1. Install the provider before the images that use it
 

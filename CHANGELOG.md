@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Home the UEFI variable-service mechanism in `crates/efivar-store-uefi`, extracted from
+  Surfacer with its host tests and AArch64/x86-64 runtime readers. Namespace routing and
+  volatile permission are caller policy; storage geometry and block I/O are caller supplied.
+- Document application-linked publication, the EBS freeze, and physical-only runtime.
+  SetVirtualAddressMap/ConvertPointer and runtime writes remain unsupported.
+
 ## 0.1.0 — 2026-10-07
 
 First release. Imported from the gobbl boot stack at `gobbl@ec63674`, where this code lived as
