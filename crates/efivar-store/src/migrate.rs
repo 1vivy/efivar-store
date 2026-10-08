@@ -1,9 +1,9 @@
 //! Offline edk2 interoperability. Import preserves every live variable, including
 //! authentication metadata; policy filtering happens when EFVS is replayed.
-use crate::{Layout, Store, efvs};
+use super::{Layout, Store, efvs};
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Error {
-    Edk2(crate::Error),
+    Edk2(super::Error),
     Efvs(efvs::Error),
 }
 impl core::fmt::Display for Error {

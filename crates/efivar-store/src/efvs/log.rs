@@ -1,5 +1,5 @@
+use super::super::sha256::digest;
 use super::*;
-use crate::sha256::digest;
 pub const RECORD_HEADER_SIZE: usize = 76;
 pub const RECORD_MIN_SIZE: usize = 112;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
