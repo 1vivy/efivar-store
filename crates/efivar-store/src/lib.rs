@@ -8,6 +8,9 @@
 //! `persist` module owns that ordered commit sequence over a caller-supplied
 //! byte device; the optional `std` feature adds a Unix file/block-device
 //! adapter.
+//!
+//! The dependency-free core supports Rust 1.82 and edition-2021 source embedding
+//! for Android GKI Rust modules; the host CLI uses the workspace toolchain.
 #![no_std]
 
 #[cfg(feature = "std")]
@@ -67,11 +70,8 @@ impl<'a> Name<'a> {
 
     pub fn units(self) -> impl Iterator<Item = u16> + 'a {
         self.0
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .copied()
-            .map(u16::from_le_bytes)
+            .chunks_exact(2)
+            .map(|word| u16::from_le_bytes([word[0], word[1]]))
     }
 }
 
@@ -194,9 +194,9 @@ impl<'a> StoreMut<'a> {
         let minimum = format::FV_HEADER + format::STORE_HEADER;
         let block_size_usize = usize::try_from(block_size).map_err(|_| Error::Bounds)?;
         if image.len() < minimum
-            || !image.len().is_multiple_of(4)
+            || image.len() % 4 != 0
             || block_size == 0
-            || !image.len().is_multiple_of(block_size_usize)
+            || image.len() % block_size_usize != 0
         {
             return Err(Error::StoreSize);
         }

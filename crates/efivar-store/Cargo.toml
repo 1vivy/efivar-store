@@ -1,9 +1,9 @@
 [package]
 name = "efivar-store"
 version.workspace = true
-edition.workspace = true
+edition = "2021"
 license.workspace = true
-rust-version.workspace = true
+rust-version = "1.82"
 description = "edk2-compatible EFI variable store on a block device: no_std, allocation-free byte-image engine"
 repository = "https://github.com/1vivy/efivar-store"
 keywords = ["efi", "uefi", "variable", "no_std", "edk2"]

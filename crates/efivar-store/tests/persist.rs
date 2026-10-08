@@ -46,10 +46,8 @@ fn span(image: &[u8], key: &[u16]) -> Option<(usize, usize)> {
         let length = (header + name_size + data_size + 3) & !3;
         if matches!(state, 0x3f | 0x3e) {
             let units: Vec<u16> = image[pos + header..pos + header + name_size - 2]
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|chunk| u16::from_le_bytes(*chunk))
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
                 .collect();
             if units == key {
                 return Some((pos, pos + length));

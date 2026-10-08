@@ -11,7 +11,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn unhex(text: &str) -> Result<Vec<u8>, Box<dyn Error>> {
-    if !text.is_ascii() || !text.len().is_multiple_of(2) {
+    if !text.is_ascii() || text.len() % 2 != 0 {
         return Err("invalid hex".into());
     }
     (0..text.len())

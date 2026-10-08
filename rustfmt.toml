@@ -1,0 +1,2 @@
+# Keep one formatting style while the kernel-compatible core uses edition 2021.
+style_edition = "2024"
