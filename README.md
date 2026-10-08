@@ -15,6 +15,11 @@ partition, written and read by firmware, a bootloader or an operating system tha
   wire-order GUIDs (not UUID text order).
 - **Attributes**: the UEFI attribute word as stored, including the refusal of authenticated,
   time-based, enhanced-authenticated and `APPEND_WRITE` updates.
+- **Authenticated variables, parsed**: the `EFI_VARIABLE_AUTHENTICATION_2` and `_3` descriptors, the
+  exact digest input a signature covers, and the rules that hold without key material — time-stamp
+  monotonicity, `APPEND_WRITE`, attribute changes, and the key roles and modes of secure boot (`auth`).
+  Parsing and policy only: the verifier is a stub, no signature is checked, and the official policy
+  refuses every authenticated write ([docs/format.md §9](docs/format.md#9-authenticated-variables-parsing-and-policy)).
 - **Formats**: edk2's normal and authenticated variable record layouts, the `VARIABLE_STORE_HEADER`,
   the `EFI_FIRMWARE_VOLUME_HEADER` around it, and record-state recovery
   (`ADDED` / `IN_DELETED_TRANSITION` / `HEADER_VALID_ONLY`) exactly as edk2 resolves them.
@@ -108,14 +113,24 @@ cargo run --locked -p efivar-store --example store-image -- init out.img 1048576
 cargo run --locked -p efivar-store --example store-image -- inspect out.img
 ```
 
+## Case studies
+
+- [Runtime variables on a Qualcomm SM8850 phone](docs/case-studies/qcom-sm8850-phone.md) — what a
+  production phone's UEFI variable posture actually is (Qualcomm `VariableDxe`, the TrustZone
+  `uefisecapp` the mainline allowlist excludes, the GPT listener), why the operating system therefore
+  has no variables, and how a block-backed store on an appended GPT partition is presented to both
+  firmware and kernel as *the* variable service. Written from lab record ids and source, with what is
+  proven, what is not, and the deferred-verification design that supersedes the on-disk format.
+
 ## Layout
 
 ```
-crates/efivar-store/   no_std core: format parsing/writing, ordered durable commit, Unix adapter
+crates/efivar-store/   no_std core: format parsing/writing, ordered durable commit, auth descriptors, Unix adapter
 cli/                   the `efivar-store` binary
-docs/format.md         byte layouts (FV, store, records, OVMF VARS, FTW)
+docs/format.md         byte layouts (FV, store, records, OVMF VARS, FTW) and the authenticated-variable API
 docs/durability.md     what persist::apply and the Unix adapter guarantee, and what they do not
 docs/consumer-guide.md lifecycle rules for a UEFI variable-service consumer
+docs/case-studies/     field evidence: platforms this store is deployed on
 ```
 
 ## License

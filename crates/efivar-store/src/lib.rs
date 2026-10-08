@@ -13,6 +13,7 @@
 #[cfg(feature = "std")]
 extern crate std;
 
+pub mod auth;
 mod format;
 pub mod mirror;
 pub mod persist;
