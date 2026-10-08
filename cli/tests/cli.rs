@@ -377,3 +377,89 @@ fn init_writes_a_standalone_store_image() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn efvs_cli_roundtrip_compact_and_import() {
+    let (dir, old) = scenario();
+    let image = dir.join("efvs.img");
+    let path = image.to_str().unwrap();
+    ok(&run(&[
+        "init", "--efvs", "--image", path, "--size", "1048576",
+    ]));
+    let inspect = ok(&run(&["--image", path, "inspect"]));
+    assert!(inspect.contains("format: EFVS v1"));
+    assert!(inspect.contains("tier: 0"));
+    let mut damaged = std::fs::read(&image).unwrap();
+    damaged[..4096].fill(0xa5);
+    std::fs::write(&image, damaged).unwrap();
+    assert!(ok(&run(&["--image", path, "inspect"])).contains("header offset: 4096"));
+    let data = dir.join("data");
+    std::fs::write(&data, b"first").unwrap();
+    ok(&run(&[
+        "--image",
+        path,
+        "set",
+        "--name",
+        "key",
+        "--guid",
+        GUID_TEXT,
+        "--attributes",
+        "7",
+        "--data-file",
+        data.to_str().unwrap(),
+    ]));
+    std::fs::write(&data, b"second").unwrap();
+    ok(&run(&[
+        "--image",
+        path,
+        "set",
+        "--name",
+        "key",
+        "--guid",
+        GUID_TEXT,
+        "--attributes",
+        "47",
+        "--data-file",
+        data.to_str().unwrap(),
+    ]));
+    let got = dir.join("got");
+    ok(&run(&[
+        "--image",
+        path,
+        "get",
+        "--name",
+        "key",
+        "--guid",
+        GUID_TEXT,
+        "--out",
+        got.to_str().unwrap(),
+    ]));
+    assert_eq!(std::fs::read(&got).unwrap(), b"firstsecond");
+    assert!(ok(&run(&["--image", path, "list"])).contains("key"));
+    ok(&run(&["--image", path, "compact"]));
+    let once = std::fs::read(&image).unwrap();
+    ok(&run(&["--image", path, "compact"]));
+    assert_eq!(std::fs::read(&image).unwrap(), once);
+    ok(&run(&[
+        "--image", path, "delete", "--name", "key", "--guid", GUID_TEXT,
+    ]));
+    assert!(
+        !run(&["--image", path, "get", "--name", "key", "--guid", GUID_TEXT])
+            .status
+            .success()
+    );
+    ok(&run(&["--image", path, "oneshot", "linux.conf"]));
+    ok(&run(&["--image", path, "oneshot", "--clear"]));
+    ok(&run(&[
+        "import-edk2",
+        "--from",
+        old.to_str().unwrap(),
+        "--image",
+        path,
+        "--size",
+        "1048576",
+        "--force",
+    ]));
+    assert!(ok(&run(&["--image", path, "inspect"])).contains("live variables: 0"));
+    std::fs::remove_dir_all(dir).unwrap();
+}

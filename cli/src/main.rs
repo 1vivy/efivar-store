@@ -12,6 +12,7 @@
 //! choosing its size and GUID and reserving FTW space stay with the consumer
 //! (a provisioning tool, a firmware installer), never with this command.
 
+mod efvs;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
@@ -28,7 +29,9 @@ const USAGE: &str = "\
 efivar-store — inspect and update an edk2 NV variable store
 
 usage:
-  efivar-store init --image PATH --size BYTES [--block BYTES] [--layout normal|auth] [--force]
+  efivar-store init --image PATH --size BYTES [--efvs --checkpoint BYTES] [--block BYTES] [--layout normal|auth] [--force]
+  efivar-store import-edk2 --from PATH --image PATH --size BYTES [--checkpoint BYTES] [--force]
+  efivar-store --image PATH compact
   efivar-store (--device PATH | --image PATH) inspect
   efivar-store (--device PATH | --image PATH) list
   efivar-store (--device PATH | --image PATH) get --name N --guid G [--out FILE]
@@ -42,9 +45,12 @@ options:
   --device PATH      block device or partition holding the store (read-write)
   --image PATH       store image file; same format and same commands
   --size BYTES       `init`: image size, a multiple of --block
-  --block BYTES      `init`: erase block size (default 4096)
+  --block BYTES      `init`: physical write unit for EFVS, erase block for edk2 (default 4096)
   --layout LAYOUT    `init`: normal or auth (default auth)
   --force            `init`: overwrite an existing image file
+  --efvs             `init`: EFVS v1 live container (otherwise edk2 interop FV)
+  --checkpoint BYTES EFVS capacity per checkpoint slot (default 131072; two slots)
+  --from PATH        `import-edk2`: source edk2 image
   --name N           variable name; UTF-8 here, UTF-16LE on disk
   --guid G           EFI GUID in UUID text form, e.g. 4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
   --attributes HEX   EFI attributes, e.g. 0x7 = NV|BS|RT; NV|BS are required
@@ -78,7 +84,7 @@ const ONESHOT_NAME: &str = "LoaderEntryOneShot";
 const ONESHOT_ATTRIBUTES: u32 = 0x7;
 
 /// Options that always take one value.
-const OPTIONS: [&str; 10] = [
+const OPTIONS: [&str; 12] = [
     "--device",
     "--image",
     "--size",
@@ -89,9 +95,11 @@ const OPTIONS: [&str; 10] = [
     "--attributes",
     "--data-file",
     "--out",
+    "--checkpoint",
+    "--from",
 ];
 /// Flags that never take a value.
-const SWITCHES: [&str; 4] = ["--force", "--clear", "--help", "-h"];
+const SWITCHES: [&str; 5] = ["--force", "--clear", "--help", "-h", "--efvs"];
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -209,6 +217,12 @@ fn run(args: &Args) -> Result<(), Failure> {
     if args.has("--help") || args.has("-h") || command == "help" {
         println!("{USAGE}");
         return Ok(());
+    }
+    if command == "import-edk2" || (command == "init" && args.has("--efvs")) {
+        return efvs::create(args);
+    }
+    if command != "init" && efvs::detect(args)? {
+        return efvs::run(args);
     }
     match command {
         "init" => init(args),

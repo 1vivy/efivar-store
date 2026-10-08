@@ -1,8 +1,16 @@
-# Byte formats
+# edk2 interoperability byte formats
+
+EFVS v1 is the live container; its checkpoint/log layouts are frozen in
+[efvs-v1.md](efvs-v1.md). This document describes the unchanged **edk2** engine
+used for import/export, inspection and migration of existing stores. `Store::parse`
+and `StoreMut` still mean edk2 FV, never EFVS. Use `efvs::Header` and `replay`
+for EFVS, and `migrate::import_edk2` for conversion to a fresh checkpoint.
 
 **Status (2026-10-07)** — the layouts `crates/efivar-store` parses and writes today, with the offsets
 its implementation uses. Everything here is byte-exact against `src/format.rs` and `src/lib.rs`;
-where the image is one edk2 also produces, the edk2 source is cited.
+where the image is one edk2 also produces, the edk2 source is cited. Section 9 covers the `auth`
+module: the authentication descriptors, the digest input a signature covers, and the rules that apply
+without key material.
 
 All multi-byte integers are little-endian. GUIDs are written in EFI on-disk order (mixed-endian:
 `Data1`/`Data2`/`Data3` little-endian, `Data4` in order), **not** in UUID text order. Erased media is
@@ -192,6 +200,90 @@ What this crate does with such an image:
   `RT`/`HARDWARE_ERROR_RECORD` (`Attributes & !0x0f != 0` or `Attributes & 3 != 3`) fail with
   `Error::UnsupportedAttributes` instead of being silently treated as a replacement.
 
+## 9. Authenticated variables: parsing and policy
+
+The `auth` module (`crates/efivar-store/src/auth.rs`) is the specification half of authenticated
+variables: it parses the authentication descriptors, rebuilds the exact digest input a signature covers,
+and applies every rule that does not depend on key material. It is pure — no I/O, no allocation, no
+dependencies, callable from firmware, a boot loader, a kernel module or a host tool. It performs **no
+cryptography and no verification of its own**; the only verifier it ships is an explicit stub.
+
+### 9.1 Descriptors
+
+- `Authentication2::parse(payload)` — `EFI_VARIABLE_AUTHENTICATION_2`, the descriptor
+  `EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS` payloads begin with (UEFI 2.10 §8.2.3, §8.2.6).
+  Layout: `EFI_TIME` (16 bytes, GMT), then a `WIN_CERTIFICATE_UEFI_GUID` whose `dwLength` counts itself.
+  `Authentication2::HEADER` is 40 bytes, `len()` is `16 + dwLength`, and `value(payload)` is every byte
+  after the descriptor (the new variable content; the descriptor itself is never variable data).
+  Refused, before a caller sees any of it: a payload shorter than `dwLength` claims; `dwLength` below the
+  certificate header; a revision other than `0x0200`; `wCertificateType` other than
+  `WIN_CERT_TYPE_EFI_GUID` (`0x0ef1`); `CertType` other than `EFI_CERT_TYPE_PKCS7_GUID`
+  (`4aafd29d-68df-49ee-8aa9-347d375665a7`); an empty `CertData`; and a time stamp whose `Pad1`,
+  `Nanosecond`, `TimeZone`, `Daylight` or `Pad2` is not zero or whose date components are out of range.
+  These are the gates edk2's `VerifyTimeBasedPayload` applies before it touches a payload.
+- `Authentication3::parse(payload)` — `EFI_VARIABLE_AUTHENTICATION_3`, which
+  `EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS` selects (UEFI 2.10 §8.2.5): a 10-byte primary descriptor
+  (`Version`, `Type`, `MetadataSize`, `Flags`), a type-specific secondary descriptor (`EFI_TIME`, or
+  `EFI_VARIABLE_AUTHENTICATION_3_NONCE`), an optional `NewCert` when
+  `EFI_VARIABLE_ENHANCED_AUTH_FLAG_UPDATE_CERT` is set, then the signing certificate. `len()` is
+  `MetadataSize` and `value(payload)` is everything after it. An unknown version or type, a reserved
+  `Flags` bit, a `MetadataSize` that does not bound the structures exactly, a zero-length nonce and a
+  certificate that is not PKCS#7 are refused. No consumer in this workspace uses `_3` yet; it is parsed
+  because the format is part of the specification this crate implements.
+
+### 9.2 The digest input
+
+`Request::signing_input()` yields the byte-exact input of UEFI 2.10 §8.2.6 step 2,
+`digest = hash (VariableName, VendorGuid, Attributes, TimeStamp, DataNew_variable_content)` — "The NULL
+character terminating the VariableName value shall not be included in the hash computation". The name is
+serialized as UTF-16LE, from either `VariableName::Units(&[u16])` or `VariableName::Bytes(&[u8])`
+(wire order, exactly what `Name::as_bytes` yields), so no caller has to allocate or copy to reach it. For
+`EFI_VARIABLE_AUTHENTICATION_3` the input follows §8.2.5 step 3: name, vendor GUID, attributes and the
+secondary descriptor, then the value, then — for a nonce update — the variable's *current* nonce, then a
+`NewCert`. `SigningInput::feed(&mut impl DigestInput)` streams the input (the name arrives two bytes at a
+time), so a boot-time verifier can hash it without a buffer; `copy_into(&mut [u8])` materializes it for
+tests and host tools and writes nothing at all when the buffer is too small.
+
+### 9.3 Rules
+
+`auth::check(&Request)` is the part of the specification that does not need a key: it reads nothing,
+writes nothing, and returns the `Plan` the caller must execute.
+
+| Situation | Result |
+| --- | --- |
+| neither, both, or the deprecated counter-based `EFI_VARIABLE_AUTHENTICATED_WRITE_ACCESS` | `Error::Descriptor` |
+| attribute bits above the defined `0xff` | `Error::Attributes` |
+| payload descriptor ≠ the descriptor the attributes select | `Error::Descriptor` |
+| `APPEND_WRITE` with the enhanced descriptor | `Error::AppendWrite` |
+| stored attribute word ≠ submitted attributes without `APPEND_WRITE` | `Error::AttributeChange` |
+| time stamp not strictly later than the stored one, without `APPEND_WRITE` | `Error::Stale` |
+| the all-zero time stamp without `APPEND_WRITE` | `Error::TimeStamp` |
+| stored authenticated variable with no recorded time stamp | `Error::MissingTimeStamp` |
+| empty value, no `APPEND_WRITE` | `Plan::Delete` |
+| `APPEND_WRITE` with a stored value | `Plan::Append` (an empty value refreshes only the time stamp) |
+| otherwise | `Plan::Replace` |
+
+### 9.4 Authorization, and what is deliberately absent
+
+`Verifier` checks the signature over the digest input; `Policy` decides whether an update may happen at
+all; `KeyStore` supplies the key state; `Role::of(name, guid)` maps the names and GUIDs of UEFI 2.10
+§32.3 (`PK`, `KEK`, `db`, `dbx`, `dbt`, `dbr`, `OsRecoveryOrder`, and everything else as the
+specification's "Private Authenticated Variable"); `Mode::of` maps `SetupMode`/`AuditMode`/`DeployedMode`.
+The policy this repository ships is `SecureBootPolicy::None`: setup mode, `SecureBoot == 0`, no keys
+enrolled, and `Error::Refused` for every authenticated write — the same refusal the byte-image engine
+already reports as `Error::AuthenticatedWrite` for an attribute word carrying `0x10`/`0x20`/`0x80`. The
+verifier it ships, `Pkcs7Verifier`, is an owner-directed stub returning
+`Error::Unsupported(Unsupported::Crypto)`, so a caller that forgets to supply a real verifier fails closed
+instead of accepting an unchecked write.
+
+**No verification is claimed while those primitives are stubs.** Layout support is not authorization: the
+engine still refuses to write an authenticated variable, and the `auth` module is a parser and a rule
+set, not a security boundary. Persistence, freshness (a monotonic value the OS cannot write) and the
+write path belong to the consumer. In this project they belong to the deferred-verification store — a
+firmware-written checkpoint plus a hash-chained, append-only log, with authenticated payloads kept as
+submitted and verified at boot-time replay — not to the edk2 image written in place. The
+[SM8850 case study](case-studies/qcom-sm8850-phone.md) describes the platform this applies to.
+
 ## References
 
 - edk2 `MdeModulePkg/Include/Guid/VariableFormat.h` — record states and header structures:
@@ -209,3 +301,13 @@ What this crate does with such an image:
   semantics: <https://uefi.org/specs/UEFI/2.11/08_Services_Runtime_Services.html>
 - `virt-firmware` (`virt-fw-vars`), an independent reader/writer of these images used as a host
   cross-check: <https://gitlab.com/kraxel/virt-firmware>
+- UEFI Specification 2.10 §8.2.3 `SetVariable()` and §8.2.6 "Using the
+  `EFI_VARIABLE_AUTHENTICATION_2` descriptor" — the descriptor layout, the signed digest input and the
+  `APPEND_WRITE` rules `auth` implements: <https://uefi.org/specs/UEFI/2.10/08_Services_Runtime_Services.html>
+- UEFI Specification 2.10 §8.2.5 "Using the `EFI_VARIABLE_AUTHENTICATION_3` descriptor" — the
+  extensible descriptor's sequencing and its own digest serialization:
+  <https://uefi.org/specs/UEFI/2.10/08_Services_Runtime_Services.html>
+- edk2 `SecurityPkg/Library/AuthVariableLib/AuthService.c` — `VerifyTimeBasedPayload` (the GMT
+  time-stamp check, the time-stamp rule at `:2126`, and the `(VariableName, VendorGuid, Attributes,
+  TimeStamp, Data)` buffer at `:2219-2265`):
+  <https://github.com/tianocore/edk2/blob/master/SecurityPkg/Library/AuthVariableLib/AuthService.c>

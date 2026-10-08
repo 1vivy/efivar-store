@@ -114,7 +114,10 @@ if you do not, the OS must boot with physical addressing.
   (<https://github.com/rhboot/efivar/blob/main/src/efivarfs.c>).
 - A file-backed store is not efivarfs: writes to it are plain block writes whose durability depends on
   flush semantics, and the OS's efivarfs view stays stale until the next boot if firmware is the only
-  thing that re-reads the store.
+  thing that re-reads the store. A store partition that *does* want to be efivarfs reaches it by
+  registering that one backend over the partition's own bytes — the
+  [SM8850 case study](case-studies/qcom-sm8850-phone.md) documents a production instance of exactly
+  that, including what the firmware side must do to be consistent with it.
 
 ## 6. Using this crate as the storage engine
 
@@ -127,5 +130,12 @@ if you do not, the OS must boot with physical addressing.
   (`mirror::decide`), and never in a live update path.
 - Read `capacity()`/`free_space()` and plan for append-only growth: a full store fails writes until a
   reclaim, and there is no implicit reclaim anywhere in this crate.
-- Layout support is not authorization: authenticated variables can be read and preserved, but not
-  written, and no signature is verified (see [format.md](format.md#8-authenticated-layout-readable-not-authorized)).
+- Layout support is not authorization: authenticated variables can be read and preserved, but the engine
+  still refuses to write one, and no signature is verified. The `auth` module
+  ([format.md](format.md#9-authenticated-variables-parsing-and-policy)) parses the authentication
+  descriptors, rebuilds the digest input a signature covers and applies the specification's own rules
+  (time-stamp monotonicity, `APPEND_WRITE`, attribute changes), but it ships no cryptographic verifier —
+  `Pkcs7Verifier` is an owner-directed stub — and its official policy, `SecureBootPolicy::None`, refuses
+  every authenticated write. Verification and freshness belong to the consumer; the
+  [SM8850 case study](case-studies/qcom-sm8850-phone.md) documents the deferred-verification model this
+  project is moving to, where the firmware keeps the submitted payload and verifies it at boot.
