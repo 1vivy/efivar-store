@@ -20,8 +20,8 @@
 //! remaining recovery is exactly the edk2 record-state recovery that
 //! [`crate::Store`] and [`crate::StoreMut`] already implement.
 
-use crate::format::{ADDED, HEADER_VALID, TRANSITION};
-use crate::{Error as FormatError, Guid, Store, StoreMut};
+use super::format::{ADDED, HEADER_VALID, TRANSITION};
+use super::{Error as FormatError, Guid, Store, StoreMut};
 
 /// Blocking byte reader over the backing store image.
 pub trait Read {
@@ -151,12 +151,13 @@ pub fn apply<I: Flush>(
         if let Change::Set {
             attributes, data, ..
         } = change
-            && !data.is_empty()
-            && let Some(existing) = existing
-            && existing.attributes == attributes
-            && existing.data == data
         {
-            return Ok(Outcome::Unchanged);
+            if !data.is_empty()
+                && existing
+                    .is_some_and(|value| value.attributes == attributes && value.data == data)
+            {
+                return Ok(Outcome::Unchanged);
+            }
         }
         (store.layout(), records_start, append, existing.is_some())
     };

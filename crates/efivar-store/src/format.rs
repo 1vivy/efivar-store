@@ -1,4 +1,4 @@
-use crate::{Error, Guid, Layout, Name};
+use super::{Error, Guid, Layout, Name};
 
 pub(crate) const FV_HEADER: usize = 72;
 pub(crate) const STORE_HEADER: usize = 28;
@@ -55,8 +55,8 @@ fn u32_at(data: &[u8], offset: usize) -> Result<u32, Error> {
 }
 
 pub(crate) fn checksum(header: &[u8]) -> u16 {
-    header.as_chunks::<2>().0.iter().fold(0u16, |sum, word| {
-        sum.wrapping_add(u16::from_le_bytes(*word))
+    header.chunks_exact(2).fold(0u16, |sum, word| {
+        sum.wrapping_add(u16::from_le_bytes([word[0], word[1]]))
     })
 }
 

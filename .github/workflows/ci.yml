@@ -29,3 +29,12 @@ jobs:
         run: cargo test --locked
       - name: Check the core builds for a bare target
         run: cargo build --locked -p efivar-store --no-default-features --target thumbv7em-none-eabihf
+  kernel-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.82.0"
+      - name: Compile the source embedding used by the GKI Rust module
+        run: rustc --edition=2021 --crate-type=lib -D warnings crates/efivar-store/compat/kernel-source.rs -o /tmp/libkernel_source.rlib

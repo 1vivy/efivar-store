@@ -165,11 +165,9 @@ fn full_store_and_failed_reclaim_leave_every_byte_unchanged() {
 fn repair_checksum(image: &mut [u8]) {
     let length = u16::from_le_bytes(image[48..50].try_into().unwrap()) as usize;
     image[50..52].fill(0);
-    let sum = image[..length]
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .fold(0u16, |sum, b| sum.wrapping_add(u16::from_le_bytes(*b)));
+    let sum = image[..length].chunks_exact(2).fold(0u16, |sum, b| {
+        sum.wrapping_add(u16::from_le_bytes([b[0], b[1]]))
+    });
     image[50..52].copy_from_slice(&sum.wrapping_neg().to_le_bytes());
 }
 
