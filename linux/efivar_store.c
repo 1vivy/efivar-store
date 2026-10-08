@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Kernel ABI only; the allocation-free Rust engine owns EFVS validation. */
+/*
+ * Kernel ABI only; the allocation-free Rust engine owns EFVS validation.
+ * Any module may export efivar_store_io_enter/leave to supply credentials
+ * for backing-device I/O. The optional provider is pinned with symbol_get.
+ */
 #include <linux/blkdev.h>
+#include <linux/cred.h>
 #include <linux/ctype.h>
 #include <linux/efi.h>
 #include <linux/fs.h>
@@ -36,12 +41,34 @@ module_param(partuuid, charp, 0);
 MODULE_PARM_DESC(partuuid, "Backing partition unique GUID");
 static DEFINE_MUTEX(store_lock);
 static struct file *store_file;
+extern const struct cred *efivar_store_io_enter(void);
+extern void efivar_store_io_leave(const struct cred *old);
+static const struct cred *(*io_enter)(void);
+static void (*io_leave)(const struct cred *old);
 static void *context;
 static u8 *image, *scratch;
 static size_t image_len, scratch_len;
 static bool ready;
 static struct efivars vars;
 
+static void release_io_provider(void)
+{
+	if (io_enter)
+		symbol_put_addr(io_enter);
+	if (io_leave)
+		symbol_put_addr(io_leave);
+	io_enter = NULL;
+	io_leave = NULL;
+}
+static void acquire_io_provider(void)
+{
+	io_enter = symbol_get(efivar_store_io_enter);
+	io_leave = symbol_get(efivar_store_io_leave);
+	if (!io_enter || !io_leave) {
+		release_io_provider();
+		pr_info("efivar_store: no io credential provider; using caller credentials\n");
+	}
+}
 static int match_partition(struct device *device, const void *value)
 {
 	struct block_device *bdev = dev_to_bdev(device);
@@ -107,19 +134,54 @@ static int discover_device(dev_t *result)
 	of_node_put(chosen);
 	return rc;
 }
+/* Caller brackets the entire I/O section; never nest credential overrides here. */
 static int read_bytes(size_t offset, void *buffer, size_t len)
 {
 	loff_t pos = offset;
 	ssize_t n = kernel_read(store_file, buffer, len, &pos);
-	return n == len ? 0 : n < 0 ? n : -EIO;
+
+	if (n == len)
+		return 0;
+	pr_err_ratelimited("efivar_store: kernel_read offset=%zu length=%zu returned %zd\n", offset,
+			   len, n);
+	return n < 0 ? n : -EIO;
+}
+static int write_bytes(size_t start, size_t end)
+{
+	loff_t pos = start;
+	ssize_t n = kernel_write(store_file, image + start, end - start, &pos);
+	int rc;
+
+	if (n != end - start) {
+		pr_err_ratelimited(
+		    "efivar_store: kernel_write offset=%zu length=%zu returned %zd\n", start,
+		    end - start, n);
+		return n < 0 ? n : -EIO;
+	}
+	rc = vfs_fsync(store_file, 0);
+	if (rc)
+		pr_err_ratelimited("efivar_store: vfs_fsync failed: %d\n", rc);
+	return rc;
 }
 static int reload(void)
 {
+	unsigned long status;
+	int rc;
+
 	ready = false;
-	if (read_bytes(0, image, image_len))
-		return -EIO;
-	if (efvs_load(context, image, image_len, scratch, scratch_len))
+	rc = read_bytes(0, image, image_len);
+	if (rc) {
+		pr_err_ratelimited("efivar_store: reload read failed: %d; callbacks disabled\n",
+				   rc);
+		return rc;
+	}
+	status = efvs_load(context, image, image_len, scratch, scratch_len);
+	if (status) {
+		pr_err_ratelimited(
+		    "efivar_store: reload replay failed: EFI status=%#lx; callbacks disabled\n",
+		    status);
 		return -EINVAL;
+	}
 	ready = true;
 	return 0;
 }
@@ -163,8 +225,14 @@ static void release_store(void)
 	kfree(context);
 	kvfree(scratch);
 	kvfree(image);
-	if (store_file)
+	if (store_file) {
+		const struct cred *old = io_enter ? io_enter() : NULL;
+
 		fput(store_file);
+		if (io_leave)
+			io_leave(old);
+	}
+	release_io_provider();
 }
 static int name_length(const u16 *name, size_t bound)
 {
@@ -240,9 +308,8 @@ static efi_status_t set_variable(efi_char16_t *name, efi_guid_t *guid, u32 attr,
 	static const u8 empty;
 	u8 verify[512];
 	size_t start, end, pos, chunk;
-	loff_t offset;
-	ssize_t n;
 	efi_status_t status;
+	const struct cred *old;
 	int units = name_length(name, MAX_NAME);
 	if (!guid || (size && !data) || size > MAX_IMAGE || units <= 0)
 		return EFI_INVALID_PARAMETER;
@@ -250,22 +317,31 @@ static efi_status_t set_variable(efi_char16_t *name, efi_guid_t *guid, u32 attr,
 	status = ready ? efvs_set(context, (u8 *)name, units * 2, guid, attr, size ? data : &empty,
 				  size, &start, &end)
 		       : EFI_DEVICE_ERROR;
-	if (!status) {
-		offset = start;
-		n = kernel_write(store_file, image + start, end - start, &offset);
-		if (n != end - start || vfs_fsync(store_file, 0))
+	if (status)
+		goto out;
+	old = io_enter ? io_enter() : NULL;
+	if (write_bytes(start, end))
+		goto io_error;
+	/* Verify exactly the appended range, without another large allocation. */
+	for (pos = start; pos < end; pos += chunk) {
+		chunk = min_t(size_t, sizeof(verify), end - pos);
+		if (read_bytes(pos, verify, chunk)) {
+			pr_err_ratelimited("efivar_store: verify read failed at offset=%zu\n", pos);
 			goto io_error;
-		/* Verify exactly the appended range, without another large allocation. */
-		for (pos = start; pos < end; pos += chunk) {
-			chunk = min_t(size_t, sizeof(verify), end - pos);
-			if (read_bytes(pos, verify, chunk) || memcmp(verify, image + pos, chunk))
-				goto io_error;
+		}
+		if (memcmp(verify, image + pos, chunk)) {
+			pr_err_ratelimited("efivar_store: verify mismatch offset=%zu length=%zu\n",
+					   pos, chunk);
+			goto io_error;
 		}
 	}
-	goto out;
+	goto io_done;
 io_error:
 	reload(); /* A failed reload leaves callbacks disabled. */
 	status = EFI_DEVICE_ERROR;
+io_done:
+	if (io_leave)
+		io_leave(old);
 out:
 	mutex_unlock(&store_lock);
 	return status;
@@ -291,16 +367,23 @@ static const struct efivar_operations ops = {
 static int __init efivar_store_init(void)
 {
 	dev_t device;
+	const struct cred *old;
 	int rc = discover_device(&device);
 	if (rc)
 		return rc;
+	acquire_io_provider();
 	store_file = bdev_file_open_by_dev(device, BLK_OPEN_READ | BLK_OPEN_WRITE, NULL, NULL);
 	if (IS_ERR(store_file)) {
 		rc = PTR_ERR(store_file);
+		pr_err("efivar_store: backing device open failed: %d\n", rc);
 		store_file = NULL;
+		release_store();
 		return rc;
 	}
+	old = io_enter ? io_enter() : NULL;
 	rc = load();
+	if (io_leave)
+		io_leave(old);
 	if (rc) {
 		pr_err("efivar_store: no usable EFVS store; firmware must initialize blank "
 		       "partitions (no bytes written)\n");

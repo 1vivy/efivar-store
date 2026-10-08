@@ -41,6 +41,56 @@ EFI_SECURITY_VIOLATION. No cryptographic verifier is shipped. Nonblocking
 SetVariable and query-store are NULL. QueryVariableInfo accepts attributes 7 and
 reports log capacity/free bytes and the checkpoint-bound maximum variable size.
 
+## Device I/O credentials
+
+The first real-phone ROM1 boot with SELinux enforcing exposed a failure absent
+from the permissive recovery test: a boot-control HAL callback inherited
+`hal_bootctl_default` credentials, while the module's backing file had been
+opened with the kernel SID. SELinux denied `fd:use` during device I/O. The write
+failed, then reload failed for the same reason and correctly disabled callbacks,
+making later efivarfs reads return EIO. The physical log remained untouched.
+
+The backend optionally acquires a credential-provider pair with `symbol_get()`
+at module init. **Any module** may export these GPL symbols:
+
+```c
+const struct cred *efivar_store_io_enter(void);
+void efivar_store_io_leave(const struct cred *old);
+```
+
+`enter` temporarily installs the provider's authorized device-I/O credentials
+and returns the caller's original credentials; `leave` restores that exact
+token on the same task. The provider owns the credentials and their security
+domain transition. The backend knows neither SELinux blob layouts nor policy
+contexts, and does not create, modify or permanently install credentials.
+
+Both exports must resolve at init. Each successful lookup pins its provider.
+If either is absent, the backend releases any partial reference and logs
+`no io credential provider; using caller credentials`. There is no later
+provider lookup: load the provider before this backend. Complete references
+remain pinned until callback exclusion/cleanup at unload or init failure, then
+are released with `symbol_put_addr()`. The export names are lookup strings, not
+undefined ELF imports, so a relocating loader need not resolve module symbols.
+
+One enter/leave pair brackets the complete probe/load section and each
+set/write/fsync/readback section, including error-path reload. Callback sections
+run under `store_lock`, without nested overrides. Every error path restores
+credentials before unlocking; file release is separately bracketed during
+cleanup before dropping the provider references. Pure in-memory get/next/query
+need no override. Initial backing-file open uses the module loader's credentials.
+Without a provider, ordinary caller-credential I/O remains available.
+
+Kernelesp supplies this optional contract using its own credential, whose domain
+it transitions to esu when second-stage policy is ready. This is an integration
+choice, not a dependency of the generic backend. Kernel read/write short counts,
+fsync errors, verification mismatches and reload failures are logged with their
+failing step and result. A failed reload still leaves callbacks disabled.
+
+The QEMU gate has **no SELinux policy** and cannot prove that an enforcing
+Android HAL no longer triggers `fd:use` denial. An enforcing real-phone boot
+and boot-control write are the acceptance proof for that security-context fix.
+The VM still checks registration, durability and failure/refusal behavior.
+
 ## Discovery and registration
 
 Accept mutually exclusive `dev=major:minor` or `partuuid=<unique-GPT-UUID>`.
@@ -129,10 +179,11 @@ Saved evidence, relative to `/home/vivy/Projects/efisp-projects`:
 `readelf -Ws` and `llvm-nm --undefined-only` show no undefined `_RN` symbol.
 Every undefined symbol exists in the saved phone kallsyms: **missing set empty**.
 The Rust object has no unwind section and disassembly of the final module shows
-no FP/NEON instructions. KMI admission reports **24 versioned entries** (including
-module_layout) and **five kallsyms-resolved imports**, with no CRC mismatch:
+no FP/NEON instructions. KMI admission reports **26 versioned entries** (including
+module_layout) and **six kallsyms-resolved imports**, with no CRC mismatch:
 
 ```text
+__symbol_get
 block_class
 efivars_generic_ops_register
 efivars_generic_ops_unregister
@@ -161,7 +212,7 @@ cargo clippy --all-targets --locked --offline -- -D warnings
 python3 linux/test_qemu.py --kernel-out /path/to/gki-out \
   --backend linux/efivar_store.ko --frontend /path/to/efivarfs.ko \
   --busybox /path/to/static-arm64-busybox --cli target/debug/efivar-store \
-  --loader /path/to/relocating-insmod --work /var/tmp/efvs-c-glue-accepted
+  --loader /path/to/relocating-insmod --work /var/tmp/efvs-io-provider-accepted
 ```
 
 All **76 existing tests plus three new FFI ABI tests** pass. FFI tests exercise
@@ -176,7 +227,11 @@ test relocation engine. Final observed output:
 PASS: immediate read, update, delete, reboot, firmware compaction, torn-tail reread and blank refusal without writes
 ```
 
-Logs are `/var/tmp/efvs-c-glue-accepted/{write,read,compact,torn,blank}.log`.
+Logs are `/var/tmp/efvs-io-provider-accepted/{write,read,compact,torn,blank}.log`.
 The blank image is host-confirmed byte-identical to its initial 1 MiB of zeroes.
+The provider is absent in this VM. Every boot reports
+`no io credential provider; using caller credentials`; the gate exercises the
+optional-provider fallback, not provider credential switching or enforcing
+SELinux access.
 UUID/DT discovery, EFI-present generic-backend replacement and physical-device
 power cuts were not exercised. **No device commands were issued.**
