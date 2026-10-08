@@ -12,8 +12,9 @@ The 1 MiB phone profile reserves two 128 KiB checkpoint slots and a 778240-byte 
 ## Components
 
 1. **[UEFI variable service](docs/uefi.md)** (`crates/efivar-store-uefi`): `no_std` + boot-time
-   `alloc`, original-firmware forwarding, volatile overlay, durable block-backed updates, private
-   runtime table publication, CRC maintenance and frozen read-only AArch64/x86-64 runtime thunks.
+   `alloc`, EFVS boot replay/compaction and crash-safe first-boot migration, original-firmware
+   forwarding, volatile overlay, durable append updates, EFVS/runtime-table publication and
+   frozen read-only AArch64/x86-64 runtime thunks.
    This is a library linked into an application, **not a standalone runtime DXE image**.
 2. **Storage engine** (`crates/efivar-store`): the EFVS v1 container ([spec](docs/efvs-v1.md)),
    the edk2 NV engine for interoperability and migration, and the pure `auth` rules.
@@ -89,9 +90,10 @@ The byte layouts of all three, with offsets, are in [docs/format.md](docs/format
 
 ### UEFI service
 
-Use `efivar-store-uefi` from `crates/efivar-store-uefi`; supply a `BlockBackend`, namespace `Policy`,
-store size, live system table and diagnostic callback to `VariableService::install`.
-Install before starting child images. See [the lifecycle and integration contract](docs/uefi.md).
+Use `efivar-store-uefi` from `crates/efivar-store-uefi`; supply a `BlockBackend` with primary
+and migration-journal I/O, namespace `Policy`, `Manifest`, verifier, anchor, live system table
+and diagnostic callback to `VariableService::install`. Install before any variable consumers;
+downstream applications use ordinary gRT calls. See [the lifecycle contract](docs/uefi.md).
 
 ### Library
 

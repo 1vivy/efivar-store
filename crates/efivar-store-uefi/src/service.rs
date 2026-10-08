@@ -1,27 +1,29 @@
-//! Managed BLI/project variables before EBS and a frozen read-only EFI runtime view.
+//! EFVS-backed variables before EBS and a frozen read-only EFI runtime view.
 //!
 //! Install once, before launching children; restore only while boot services are
 //! live. The index is physical-address-only: SetVirtualAddressMap is not supported.
 //! Direct-partition OS writes leave the already-frozen runtime view stale until reboot.
+use crate::backend::Manifest;
 use crate::variables::{self as logic, Service, index, runtime};
-use alloc::{boxed::Box, vec, vec::Vec};
+use alloc::{boxed::Box, vec};
 use core::{
     ffi::c_void,
     ptr::{self, NonNull, addr_of, addr_of_mut},
     sync::atomic::{AtomicBool, AtomicPtr, Ordering},
 };
+use efivar_store::efvs;
 use efivar_store::persist::{Flush, Read, Write};
 use r_efi::efi::{self, Status};
 mod attributes;
 mod cache;
+mod config_table;
 mod firmware;
 pub mod mechanism;
 pub mod memory_map;
 mod properties;
-/// Byte-addressed persistent backend. Flush durably orders preceding writes.
-/// Offsets are relative to the selected store, never a disk-global LBA.
-pub trait BlockBackend: Flush<Error = Status> {}
-impl<T: Flush<Error = Status>> BlockBackend for T {}
+/// Persistent store and consumer-owned first-boot migration journal.
+pub trait BlockBackend: crate::backend::Storage<Error = Status> {}
+impl<T: crate::backend::Storage<Error = Status>> BlockBackend for T {}
 struct Backend(Box<dyn BlockBackend>);
 impl Read for Backend {
     type Error = Status;
@@ -39,12 +41,43 @@ impl Flush for Backend {
         self.0.flush()
     }
 }
+impl crate::backend::Storage for Backend {
+    fn backup_read(&mut self, offset: usize, bytes: &mut [u8]) -> Result<(), Status> {
+        self.0.backup_read(offset, bytes)
+    }
+    fn backup_write(&mut self, offset: usize, bytes: &[u8]) -> Result<(), Status> {
+        self.0.backup_write(offset, bytes)
+    }
+    fn backup_flush(&mut self) -> Result<(), Status> {
+        self.0.backup_flush()
+    }
+}
+
+struct Verifier(Box<dyn efvs::Verifier>);
+impl efvs::Verifier for Verifier {
+    fn authorize(
+        &self,
+        name: &[u8],
+        guid: &efvs::Guid,
+        attributes: u32,
+    ) -> Result<(), efvs::Error> {
+        self.0.authorize(name, guid, attributes)
+    }
+    fn verify(
+        &mut self,
+        request: efvs::RecordInput<'_>,
+        authentication: efivar_store::auth::Authentication2<'_>,
+        state: &efvs::State<'_>,
+    ) -> Result<(), efvs::Error> {
+        self.0.verify(request, authentication, state)
+    }
+}
 
 const PAGE_SIZE: usize = 4096;
 static CONTEXT: AtomicPtr<Context> = AtomicPtr::new(ptr::null_mut());
 static BUSY: AtomicBool = AtomicBool::new(false);
 struct Context {
-    service: Service<Backend, firmware::Original>,
+    service: Service<Backend, firmware::Original, Verifier>,
     snapshot: NonNull<u8>,
 }
 impl Context {
@@ -65,6 +98,7 @@ pub struct VariableService {
     snapshot_address: u64,
     mechanism: Option<mechanism::Override>,
     properties: properties::Publication,
+    config_table: Option<config_table::Publication>,
     attributes: Option<attributes::Correction>,
 }
 impl VariableService {
@@ -75,8 +109,10 @@ impl VariableService {
     pub fn install(
         table: NonNull<efi::SystemTable>,
         backend: impl BlockBackend + 'static,
-        size: usize,
+        manifest: Manifest,
         policy: logic::Policy,
+        verifier: impl efvs::Verifier + 'static,
+        anchor: &mut impl efvs::AnchorOps,
         report: fn(mechanism::Report),
     ) -> Result<Self, Status> {
         if !CONTEXT.load(Ordering::Acquire).is_null() {
@@ -93,8 +129,10 @@ impl VariableService {
                 truncated: false,
                 policy,
             },
-            size,
+            manifest,
             policy,
+            Verifier(Box::new(verifier)),
+            anchor,
         )
         .map_err(firmware::status)?;
         let mut snapshot_address = 0;
@@ -151,8 +189,13 @@ impl VariableService {
             snapshot_address,
             mechanism: None,
             properties,
+            config_table: None,
             attributes: None,
         };
+        // All boot replay/compaction and anchor operations completed before publication.
+        // SAFETY: this pinned context is exclusively owned during installation.
+        let config = unsafe { value.context.as_ref() }.service.store.config();
+        value.config_table = Some(config_table::Publication::install(table, config)?);
         let start = addr_of!(runtime::efivar_store_blob_start).addr();
         let end = addr_of!(runtime::efivar_store_blob_end).addr();
         let mechanism = mechanism::Override::install(
@@ -219,6 +262,10 @@ impl VariableService {
         }
         drop(self.mechanism.take());
         CONTEXT.store(ptr::null_mut(), Ordering::Release);
+        if let Some(publication) = self.config_table.as_mut() {
+            publication.restore()?;
+        }
+        self.config_table = None;
         self.properties.restore()?;
         // SAFETY: callback table and event were restored before dropping boot state.
         unsafe { drop(Box::from_raw(self.context.as_ptr())) };
@@ -267,54 +314,10 @@ pub fn installed() -> bool {
     !CONTEXT.load(Ordering::Acquire).is_null()
 }
 
-pub fn get(name: &str, guid: &efi::Guid) -> Result<Option<(u32, Vec<u8>)>, Status> {
-    let key = firmware::guid_bytes(guid);
+/// Inspect the live service without opening or parsing its backing partition.
+pub fn inspect() -> Result<crate::backend::Inspection, Status> {
     let (context, _guard) = context()?;
-    if !matches!((context.service.policy)(&key), logic::Route::Store { .. }) {
-        return Err(Status::UNSUPPORTED);
-    }
-    let name: Vec<u16> = name.encode_utf16().collect();
-    match context.service.managed_value(&name, &key) {
-        Ok((attributes, data)) => Ok(Some((attributes, data.to_vec()))),
-        Err(logic::Error::NotFound) => Ok(None),
-        Err(error) => Err(firmware::status(error)),
-    }
-}
-
-pub fn set(name: &str, guid: &efi::Guid, attributes: u32, data: &[u8]) -> Result<(), Status> {
-    let key = firmware::guid_bytes(guid);
-    let (context, _guard) = context()?;
-    if !matches!((context.service.policy)(&key), logic::Route::Store { .. }) {
-        return Err(Status::UNSUPPORTED);
-    }
-    let name: Vec<u16> = name.encode_utf16().collect();
-    context
-        .service
-        .set(&name, &key, attributes, data)
-        .map_err(firmware::status)?;
-    context.rebuild()
-}
-
-/// Delete through the service, then independently reload the persistent image.
-pub fn delete_durable(name: &str, guid: &efi::Guid) -> Result<(), Status> {
-    let key = firmware::guid_bytes(guid);
-    let (context, _guard) = context()?;
-    if !matches!((context.service.policy)(&key), logic::Route::Store { .. }) {
-        return Err(Status::UNSUPPORTED);
-    }
-    let name: Vec<u16> = name.encode_utf16().collect();
-    match context.service.set(&name, &key, 0, &[]) {
-        Ok(()) | Err(logic::Error::NotFound) => {}
-        Err(error) => return Err(firmware::status(error)),
-    }
-    context.rebuild()?;
-    let mut image = vec![0; context.service.image_size()];
-    context.service.io.read_at(0, &mut image)?;
-    let store = efivar_store::Store::parse(&image).map_err(|_| Status::COMPROMISED_DATA)?;
-    if store.get(&name, &key).is_some() {
-        return Err(Status::DEVICE_ERROR);
-    }
-    Ok(())
+    context.service.store.inspect().map_err(firmware::status)
 }
 
 unsafe fn name<'a>(raw: *const u16, limit: usize) -> Result<&'a [u16], Status> {

@@ -1,5 +1,6 @@
 use super::super::*;
 use super::{BLI, PROJECT, name, service};
+use alloc::vec;
 
 #[test]
 fn runtime_view_excludes_boot_only_and_refreshes_forwarded_firmware_updates() {
@@ -51,5 +52,5 @@ fn firmware_capture_truncation_is_explicit_without_forcing_persistence() {
     let reader = index::Reader::parse(&bytes).unwrap();
     assert!(reader.truncated());
     assert_eq!(reader.get(&name("TooLarge"), &guid), Err(Error::NotFound));
-    assert_eq!(service.io.writes, 0);
+    assert_eq!(service.store.io.writes, 0);
 }

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Switch the UEFI service's live backend to EFVS: first-boot initialization/import,
+  highest-valid-generation replay, durable compaction, anchor bump/lock before publication,
+  checked boot-time append updates and EFVS runtime configuration-table publication.
+- Make first-boot conversion restartable through an independently durable migration journal;
+  populate both imported checkpoint pairs and retire the journal before exposing callbacks.
+  Add write/flush/torn-marker fault tests, next-boot OS-log replay and anchor lifecycle tests.
+- Expose a read-only service inspection API; application variable users call gRT rather than
+  private get/set shortcuts. Keep read-only physical runtime and explicit tier-0 Policy None.
 - Home the UEFI variable-service mechanism in `crates/efivar-store-uefi`, extracted from
   Surfacer with its host tests and AArch64/x86-64 runtime readers. Namespace routing and
   volatile permission are caller policy; storage geometry and block I/O are caller supplied.

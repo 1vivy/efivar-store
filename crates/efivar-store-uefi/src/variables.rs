@@ -1,9 +1,10 @@
 //! EFI variable routing and immutable physical-runtime index.
 //!
-//! Authenticated and append writes are unsupported. QueryVariableInfo describes
+//! The caller's verifier governs persistent updates. QueryVariableInfo describes
 //! our managed capacity by attribute class, not a GUID-specific firmware promise.
-use alloc::{vec, vec::Vec};
-use efivar_store::{Guid, Store, persist};
+use crate::backend::{Efvs, Manifest, Storage, units};
+use alloc::vec::Vec;
+use efivar_store::{Guid, efvs};
 
 pub mod index;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -22,6 +23,8 @@ pub enum Error {
     InvalidParameter,
     Unsupported,
     NotFound,
+    SecurityViolation,
+    WriteProtected,
     BufferTooSmall(usize),
     OutOfResources,
     Device,
@@ -84,23 +87,25 @@ pub trait Firmware {
     }
 }
 
-pub struct Service<I, F> {
-    pub io: I,
+pub struct Service<I, F, V = efvs::PolicyNone> {
+    pub store: Efvs<I, V>,
     pub policy: Policy,
     pub firmware: F,
-    image: Vec<u8>,
-    scratch: Vec<u8>,
     overlay: Vec<Variable>,
     captured: Vec<Variable>,
-    valid: bool,
     pub capture_truncated: bool,
 }
 
-impl<I: persist::Flush, F: Firmware> Service<I, F> {
-    pub fn open(mut io: I, mut firmware: F, size: usize, policy: Policy) -> Result<Self, Error> {
-        let mut image = vec![0; size];
-        io.read_at(0, &mut image).map_err(|_| Error::Device)?;
-        Store::parse(&image).map_err(|_| Error::Corrupt)?;
+impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
+    pub fn open(
+        io: I,
+        mut firmware: F,
+        manifest: Manifest,
+        policy: Policy,
+        verifier: V,
+        anchor: &mut impl efvs::AnchorOps,
+    ) -> Result<Self, Error> {
+        let store = Efvs::open(io, manifest, verifier, anchor)?;
         let mut capture_truncated = false;
         let mut captured = Vec::new();
         let mut bytes = 0;
@@ -123,31 +128,21 @@ impl<I: persist::Flush, F: Firmware> Service<I, F> {
         }
         capture_truncated |= firmware.truncated();
         Ok(Self {
-            io,
+            store,
             policy,
             firmware,
-            image,
-            scratch: vec![0; size],
             overlay: Vec::new(),
             captured,
-            valid: true,
             capture_truncated,
         })
     }
 
     pub fn image_size(&self) -> usize {
-        self.image.len()
+        self.store.image_size()
     }
 
     fn reload(&mut self) -> Result<(), Error> {
-        if !self.valid {
-            self.io
-                .read_at(0, &mut self.image)
-                .map_err(|_| Error::Device)?;
-            Store::parse(&self.image).map_err(|_| Error::Corrupt)?;
-            self.valid = true;
-        }
-        Ok(())
+        self.store.reload()
     }
 
     pub fn get(&mut self, name: &[u16], guid: &Guid) -> Result<Variable, Error> {
@@ -180,11 +175,7 @@ impl<I: persist::Flush, F: Firmware> Service<I, F> {
         {
             return Ok((v.attributes, &v.data));
         }
-        Store::parse(&self.image)
-            .map_err(|_| Error::Corrupt)?
-            .get(name, guid)
-            .map(|v| (v.attributes, v.data))
-            .ok_or(Error::NotFound)
+        self.store.get(name, guid)
     }
 
     pub fn set(
@@ -202,14 +193,14 @@ impl<I: persist::Flush, F: Firmware> Service<I, F> {
         if !valid_name(name) {
             return Err(Error::InvalidParameter);
         }
-        if attributes & !7 != 0 {
+        if attributes & !0x6f != 0 {
             return Err(Error::Unsupported);
         }
         if attributes & RT != 0 && attributes & BS == 0 {
             return Err(Error::InvalidParameter);
         }
         self.reload()?;
-        let deleting = attributes == 0 || data.is_empty();
+        let deleting = crate::backend::deleting(attributes, data)?;
         let previous = match self.managed_value(name, guid) {
             Ok((attributes, data)) => Some((attributes, data.len())),
             Err(Error::NotFound) => None,
@@ -219,18 +210,23 @@ impl<I: persist::Flush, F: Firmware> Service<I, F> {
             return Err(Error::NotFound);
         }
         if !deleting {
-            validate_attributes(attributes)?;
+            if attributes & BS == 0 {
+                return Err(Error::InvalidParameter);
+            }
             if data.len() > MAX_VALUE {
                 return Err(Error::OutOfResources);
             }
-            if previous.as_ref().is_some_and(|v| v.0 != attributes) {
+            if previous
+                .as_ref()
+                .is_some_and(|v| v.0 != attributes & !efvs::ATTR_APPEND)
+            {
                 return Err(Error::InvalidParameter);
             }
             if previous.is_none()
                 && attributes & RT != 0
-                && Store::parse(&self.image)
-                    .map_err(|_| Error::Corrupt)?
-                    .list()
+                && self
+                    .store
+                    .variables()?
                     .filter(|v| managed(self.policy, &v.guid) && v.attributes & RT != 0)
                     .count()
                     + self
@@ -248,6 +244,9 @@ impl<I: persist::Flush, F: Firmware> Service<I, F> {
             .as_ref()
             .map_or(attributes & NV == 0, |v| v.0 & NV == 0);
         if volatile {
+            if !deleting {
+                validate_attributes(attributes)?;
+            }
             if !matches!((self.policy)(guid), Route::Store { volatile: true }) {
                 return Err(Error::Unsupported);
             }
@@ -274,32 +273,7 @@ impl<I: persist::Flush, F: Firmware> Service<I, F> {
             }
             return Ok(());
         }
-        let change = if deleting {
-            persist::Change::Delete { name, guid }
-        } else {
-            persist::Change::Set {
-                name,
-                guid,
-                attributes,
-                data,
-            }
-        };
-        if let Err(e) = persist::apply(&mut self.io, &mut self.image, &mut self.scratch, change) {
-            self.valid = false;
-            return Err(match e {
-                persist::Error::Format(
-                    efivar_store::Error::Full | efivar_store::Error::ScratchTooSmall,
-                ) => Error::OutOfResources,
-                persist::Error::Format(
-                    efivar_store::Error::AuthenticatedWrite
-                    | efivar_store::Error::UnsupportedAttributes,
-                ) => Error::Unsupported,
-                persist::Error::Format(efivar_store::Error::Name) => Error::InvalidParameter,
-                persist::Error::Format(_) => Error::Corrupt,
-                _ => Error::Device,
-            });
-        }
-        Ok(())
+        self.store.set(name, guid, attributes, data)
     }
 
     pub fn refresh_capture(&mut self, name: &[u16], guid: &Guid) {
@@ -311,9 +285,8 @@ impl<I: persist::Flush, F: Firmware> Service<I, F> {
                     .iter()
                     .map(|v| index::RECORD + (v.name.len() + 1) * 2 + v.data.len() + 7)
                     .sum();
-                let managed_count = Store::parse(&self.image).map_or(MAX_VARIABLES, |store| {
-                    store
-                        .list()
+                let managed_count = self.store.variables().map_or(MAX_VARIABLES, |variables| {
+                    variables
                         .filter(|v| managed(self.policy, &v.guid) && v.attributes & RT != 0)
                         .count()
                 });
@@ -346,12 +319,12 @@ impl<I: persist::Flush, F: Firmware> Service<I, F> {
     /// Managed keys first, then non-managed firmware keys; neither phase copies values.
     pub fn list(&mut self) -> Result<Vec<Key>, Error> {
         self.reload()?;
-        let mut values: Vec<_> = Store::parse(&self.image)
-            .map_err(|_| Error::Corrupt)?
-            .list()
+        let mut values: Vec<_> = self
+            .store
+            .variables()?
             .filter(|v| managed(self.policy, &v.guid))
             .map(|v| Key {
-                name: v.name.units().collect(),
+                name: units(v.name).collect(),
                 guid: v.guid,
             })
             .collect();
@@ -378,12 +351,8 @@ impl<I: persist::Flush, F: Firmware> Service<I, F> {
 
     pub fn snapshot(&mut self, output: &mut [u8]) -> Result<(), Error> {
         self.reload()?;
-        let store = Store::parse(&self.image).map_err(|_| Error::Corrupt)?;
-        let nv = (
-            store.capacity() as u64,
-            store.free_space() as u64,
-            MAX_VALUE as u64,
-        );
+        let (maximum, remaining) = self.store.capacity()?;
+        let nv = (maximum as u64, remaining as u64, MAX_VALUE as u64);
         let used: usize = self
             .overlay
             .iter()
@@ -396,13 +365,14 @@ impl<I: persist::Flush, F: Firmware> Service<I, F> {
         );
         let mut builder = index::Builder::new(output, self.capture_truncated)?;
         builder.capacity(nv, volatile);
-        let mut values: Vec<_> = store
-            .list()
+        let mut values: Vec<_> = self
+            .store
+            .variables()?
             .filter(|v| managed(self.policy, &v.guid) && v.attributes & RT != 0)
             .map(|v| {
                 (
                     v.guid,
-                    v.name.units().collect::<Vec<_>>(),
+                    units(v.name).collect::<Vec<_>>(),
                     v.attributes,
                     v.data,
                 )
@@ -431,8 +401,7 @@ impl<I: persist::Flush, F: Firmware> Service<I, F> {
         validate_attributes(attributes)?;
         self.reload()?;
         let (maximum, remaining) = if attributes & NV != 0 {
-            let store = Store::parse(&self.image).map_err(|_| Error::Corrupt)?;
-            (store.capacity(), store.free_space())
+            self.store.capacity()?
         } else {
             (
                 OVERLAY_BYTES,

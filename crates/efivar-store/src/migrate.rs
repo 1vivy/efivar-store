@@ -20,7 +20,7 @@ pub fn import_edk2(
 ) -> Result<usize, Error> {
     let store = Store::parse(source).map_err(Error::Edk2)?;
     // Build the entire checkpoint before touching the destination.
-    efvs::Header::new(destination.len(), checkpoint_capacity).map_err(Error::Efvs)?;
+    let header = efvs::Header::new(destination.len(), checkpoint_capacity).map_err(Error::Efvs)?;
     let scratch = scratch
         .get_mut(..checkpoint_capacity)
         .ok_or(Error::Efvs(efvs::Error::Full))?;
@@ -46,6 +46,15 @@ pub fn import_edk2(
         count += 1;
     }
     efvs::initialize(destination, checkpoint_capacity).map_err(Error::Efvs)?;
-    efvs::compact(destination, &state).map_err(Error::Efvs)?;
+    // Both initial generations must contain the imported state. Publishing an
+    // empty fallback pair would lose every variable after one damaged header.
+    for offset in [
+        header.checkpoint_offset,
+        header.checkpoint_offset + checkpoint_capacity,
+    ] {
+        state
+            .encode_checkpoint(&mut destination[offset..offset + checkpoint_capacity])
+            .map_err(Error::Efvs)?;
+    }
     Ok(count)
 }

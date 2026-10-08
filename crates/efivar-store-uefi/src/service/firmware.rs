@@ -29,6 +29,8 @@ pub(crate) fn status(error: Error) -> Status {
         Error::InvalidParameter => Status::INVALID_PARAMETER,
         Error::Unsupported => Status::UNSUPPORTED,
         Error::NotFound => Status::NOT_FOUND,
+        Error::SecurityViolation => Status::SECURITY_VIOLATION,
+        Error::WriteProtected => Status::WRITE_PROTECTED,
         Error::BufferTooSmall(_) => Status::BUFFER_TOO_SMALL,
         Error::OutOfResources => Status::OUT_OF_RESOURCES,
         Error::Device => Status::DEVICE_ERROR,

@@ -1,4 +1,5 @@
 use super::*;
+use alloc::vec;
 pub const BLI: Guid = [
     0x82, 0xb0, 0x67, 0x4a, 0x4c, 0x0a, 0xcf, 0x41, 0xb6, 0xc7, 0x44, 0x0b, 0x29, 0xbb, 0x8c, 0x4f,
 ];
@@ -16,13 +17,14 @@ fn policy(guid: &Guid) -> Route {
 }
 
 use efivar_store::{
-    Layout, StoreMut,
+    efvs,
     persist::{Flush, Read, Write},
 };
 #[path = "snapshot_tests.rs"]
 mod snapshot_tests;
 struct Memory {
     bytes: Vec<u8>,
+    journal: Vec<u8>,
     writes: usize,
     fail: bool,
 }
@@ -44,6 +46,19 @@ impl Write for Memory {
             .get_mut(offset..offset + data.len())
             .ok_or(())?
             .copy_from_slice(data);
+        Ok(())
+    }
+}
+impl Storage for Memory {
+    fn backup_read(&mut self, offset: usize, bytes: &mut [u8]) -> Result<(), ()> {
+        bytes.copy_from_slice(&self.journal[offset..offset + bytes.len()]);
+        Ok(())
+    }
+    fn backup_write(&mut self, offset: usize, bytes: &[u8]) -> Result<(), ()> {
+        self.journal[offset..offset + bytes.len()].copy_from_slice(bytes);
+        Ok(())
+    }
+    fn backup_flush(&mut self) -> Result<(), ()> {
         Ok(())
     }
 }
@@ -88,21 +103,55 @@ impl Firmware for Fake {
 }
 fn service() -> Service<Memory, Fake> {
     let mut bytes = vec![0; 64 * 1024];
-    StoreMut::format(&mut bytes, Layout::Authenticated, 4096).unwrap();
+    efvs::initialize(&mut bytes, 16 * 1024).unwrap();
     Service::open(
         Memory {
             bytes,
             writes: 0,
             fail: false,
+            journal: vec![0; crate::migration::journal_size(64 * 1024)],
         },
         Fake::default(),
-        64 * 1024,
+        Manifest {
+            size: 64 * 1024,
+            checkpoint_capacity: 16 * 1024,
+            write_unit: 4096,
+            partition_guid: PROJECT,
+        },
         policy,
+        efvs::PolicyNone,
+        &mut efvs::NoneAnchor::new(),
     )
     .unwrap()
 }
 fn name(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
+}
+
+fn disk_value(bytes: &[u8], name: &[u16], guid: &Guid) -> Option<Vec<u8>> {
+    let mut scratch = vec![0; 16 * 1024];
+    let replay = efvs::replay(bytes, &mut scratch, &mut efvs::PolicyNone, 0).unwrap();
+    let name: Vec<u8> = name.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+    replay.state.get(&name, guid).map(|v| v.data.to_vec())
+}
+
+fn os_write(bytes: &mut [u8], name: &[u16], guid: Guid, data: &[u8]) {
+    let mut scratch = vec![0; 16 * 1024];
+    let mut replay = efvs::replay(bytes, &mut scratch, &mut efvs::PolicyNone, 0).unwrap();
+    let name: Vec<u8> = name.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+    efvs::append(
+        bytes,
+        efvs::RecordInput {
+            name: &name,
+            guid,
+            attributes: 7,
+            data,
+            operation: efvs::Operation::Set,
+        },
+        &mut replay.state,
+        &mut efvs::PolicyNone,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -115,16 +164,16 @@ fn bli_attributes_sizing_and_durable_deletion() {
     );
     assert_eq!(
         service.set(&key, &BLI, 0x27, b"bad"),
-        Err(Error::Unsupported)
+        Err(Error::SecurityViolation)
     );
     service.set(&key, &BLI, NV | BS | RT, b"entry\0").unwrap();
-    assert!(service.io.writes > 0);
+    assert!(service.store.io.writes > 0);
     assert_eq!(
         service.set(&key, &BLI, RT, &[]),
         Err(Error::InvalidParameter)
     );
     assert_eq!(
-        service.set(&key, &BLI, 0x47, b"append"),
+        service.set(&key, &BLI, 0x107, b"unsupported"),
         Err(Error::Unsupported)
     );
     let value = service.get(&key, &BLI).unwrap();
@@ -137,20 +186,11 @@ fn bli_attributes_sizing_and_durable_deletion() {
         Err(Error::InvalidParameter)
     );
     assert_eq!(
-        Store::parse(&service.io.bytes)
-            .unwrap()
-            .get(&key, &BLI)
-            .unwrap()
-            .data,
+        disk_value(&service.store.io.bytes, &key, &BLI).unwrap(),
         b"entry\0"
     );
     service.set(&key, &BLI, 0, &[]).unwrap();
-    assert!(
-        Store::parse(&service.io.bytes)
-            .unwrap()
-            .get(&key, &BLI)
-            .is_none()
-    );
+    assert!(disk_value(&service.store.io.bytes, &key, &BLI).is_none());
     assert_eq!(service.set(&key, &BLI, 0, &[]), Err(Error::NotFound));
 }
 #[test]
@@ -162,13 +202,8 @@ fn volatile_overlay_never_persists_and_enumeration_suppresses_firmware_managed_k
         .set(&key, &BLI, BS | RT, b"firmware")
         .unwrap();
     service.set(&key, &BLI, BS | RT, b"Surfacer").unwrap();
-    assert_eq!(service.io.writes, 0);
-    assert!(
-        Store::parse(&service.io.bytes)
-            .unwrap()
-            .get(&key, &BLI)
-            .is_none()
-    );
+    assert_eq!(service.store.io.writes, 0);
+    assert!(disk_value(&service.store.io.bytes, &key, &BLI).is_none());
     let other = [0x99; 16];
     service
         .firmware
@@ -203,10 +238,7 @@ fn snapshot_tracks_pre_ebs_updates_and_is_stale_after_direct_write() {
     );
     service.set(&key, &PROJECT, 7, b"b").unwrap();
     service.snapshot(&mut snapshot).unwrap();
-    StoreMut::parse(&mut service.io.bytes)
-        .unwrap()
-        .set(&key, &PROJECT, 7, b"c")
-        .unwrap();
+    os_write(&mut service.store.io.bytes, &key, PROJECT, b"c");
     assert_eq!(
         index::Reader::parse(&snapshot)
             .unwrap()
@@ -220,7 +252,7 @@ fn snapshot_tracks_pre_ebs_updates_and_is_stale_after_direct_write() {
 fn persistence_error_reloads_before_the_next_operation() {
     let mut service = service();
     let key = name("LoaderEntryDefault");
-    service.io.fail = true;
+    service.store.io.fail = true;
     assert_eq!(service.set(&key, &BLI, 7, b"entry"), Err(Error::Device));
     assert_eq!(service.get(&key, &BLI), Err(Error::NotFound));
     service.set(&key, &BLI, 7, b"entry").unwrap();
@@ -419,4 +451,117 @@ fn x86_runtime_efiapi_differential_reader_and_write_refusal() {
     assert_eq!(result, ERROR | 2);
     // SAFETY: exact mapping created above, all callback use has completed.
     assert_eq!(unsafe { munmap(code.cast(), size) }, 0);
+}
+
+#[test]
+fn next_boot_replays_os_log_and_compacts_torn_tail_before_append() {
+    let mut first = service();
+    let key = name("Slot-rom1");
+    first.set(&key, &PROJECT, 7, b"firmware").unwrap();
+    os_write(&mut first.store.io.bytes, &key, PROJECT, b"os");
+    let h = efvs::Header::decode(&first.store.io.bytes).unwrap();
+    let cp = efvs::Checkpoint::decode(&first.store.io.bytes[h.checkpoint_range()]).unwrap();
+    let mut log = efvs::Log::new(
+        &first.store.io.bytes[h.log_offset..],
+        cp.hash,
+        cp.next_sequence,
+    );
+    for _ in log.by_ref() {}
+    let end = h.log_offset + log.consumed;
+    first.store.io.bytes[end..end + 4].copy_from_slice(b"EFVR");
+    let mut anchor = efvs::NoneAnchor::new();
+    let mut next = Service::open(
+        first.store.io,
+        Fake::default(),
+        Manifest {
+            size: 64 * 1024,
+            checkpoint_capacity: 16 * 1024,
+            write_unit: 4096,
+            partition_guid: PROJECT,
+        },
+        policy,
+        efvs::PolicyNone,
+        &mut anchor,
+    )
+    .unwrap();
+    assert_eq!(next.get(&key, &PROJECT).unwrap().data, b"os");
+    assert!(next.store.io.bytes[h.log_offset..].iter().all(|b| *b == 0));
+    let config = next.store.config();
+    assert_eq!(config.partition_guid, PROJECT);
+    assert_eq!(config.posture_tier, 0);
+    assert_eq!(config.anchor_value, 0);
+    assert_eq!(
+        efvs::AnchorOps::bump(&mut anchor, 1),
+        Err(efvs::Error::Locked)
+    );
+    next.set(&key, &PROJECT, 7 | efvs::ATTR_APPEND, b"+new")
+        .unwrap();
+    assert_eq!(
+        disk_value(&next.store.io.bytes, &key, &PROJECT).unwrap(),
+        b"os+new"
+    );
+}
+
+#[test]
+fn boot_only_mutations_are_checkpointed_not_runtime_log_records() {
+    let mut service = service();
+    let key = name("HandoffOrigin");
+    service.set(&key, &PROJECT, NV | BS, b"intent").unwrap();
+    let h = efvs::Header::decode(&service.store.io.bytes).unwrap();
+    assert!(
+        service.store.io.bytes[h.log_offset..]
+            .iter()
+            .all(|b| *b == 0)
+    );
+    assert_eq!(
+        disk_value(&service.store.io.bytes, &key, &PROJECT).unwrap(),
+        b"intent"
+    );
+    service.set(&key, &PROJECT, 0, &[]).unwrap();
+    service.store.verify_absent(&key, &PROJECT).unwrap();
+    assert!(disk_value(&service.store.io.bytes, &key, &PROJECT).is_none());
+}
+
+#[test]
+fn failed_boot_compaction_does_not_lock_or_publish_an_anchor() {
+    struct Anchor {
+        locked: bool,
+    }
+    impl efvs::AnchorOps for Anchor {
+        fn read(&mut self) -> Result<u64, efvs::Error> {
+            Ok(0)
+        }
+        fn bump(&mut self, _: u64) -> Result<(), efvs::Error> {
+            panic!("unauthenticated write must not bump")
+        }
+        fn lock(&mut self) -> Result<(), efvs::Error> {
+            self.locked = true;
+            Ok(())
+        }
+        fn capabilities(&self) -> u32 {
+            0
+        }
+    }
+    let mut first = service();
+    os_write(
+        &mut first.store.io.bytes,
+        &name("BootedRom"),
+        PROJECT,
+        b"rom2",
+    );
+    first.store.io.fail = true;
+    let mut anchor = Anchor { locked: false };
+    let result = Efvs::open(
+        first.store.io,
+        Manifest {
+            size: 64 * 1024,
+            checkpoint_capacity: 16 * 1024,
+            write_unit: 4096,
+            partition_guid: PROJECT,
+        },
+        efvs::PolicyNone,
+        &mut anchor,
+    );
+    assert!(matches!(result, Err(Error::Device)));
+    assert!(!anchor.locked);
 }

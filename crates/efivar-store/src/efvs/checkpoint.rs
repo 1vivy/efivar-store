@@ -205,6 +205,18 @@ impl<'a> State<'a> {
     pub fn insert_checkpoint(&mut self, v: Variable<'_>) -> Result<(), Error> {
         self.update(v, Operation::Set)
     }
+    /// Firmware-only checkpoint deletion; callers enforce boot-time authorization.
+    /// Runtime clients must use `apply`, which refuses boot-services-only keys.
+    pub fn delete_checkpoint(&mut self, name: &[u8], guid: &Guid) -> Result<(), Error> {
+        let variable = Variable {
+            name,
+            guid: *guid,
+            attributes: 0,
+            timestamp: [0; 16],
+            data: &[],
+        };
+        self.update(variable, Operation::Delete)
+    }
     pub(crate) fn update(&mut self, v: Variable<'_>, op: Operation) -> Result<(), Error> {
         if !valid_name(v.name) || v.data.len() > u32::MAX as usize {
             return Err(Error::Name);

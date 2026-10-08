@@ -7,28 +7,35 @@ allocation-free. The sole UEFI ABI dependency is `r-efi = 6.0.0`, resolved offli
 
 ## Lifecycle: manifest → install → EBS → runtime
 
-1. **Manifest (consumer).** Discover and validate the selected device/partition. Supply its byte
-   size and an implementation of `service::BlockBackend` (the engine's `Read`, `Write`, `Flush`
-   traits with `r_efi::efi::Status` errors). Flush must durably order earlier writes. Choose a
-   `Policy` function mapping vendor GUIDs to `Route::Firmware` or `Route::Store { volatile }`.
-   The latter boolean grants volatile-overlay writes in that namespace. Names, project/BLI GUIDs,
-   partition size, spare-file lifecycle, provisioning, logging and trail records are not library policy.
-2. **Install at application start, before children (consumer publishing call).** Call
-   `VariableService::install(table, backend, size, policy, report)`. Only one installation is permitted.
-   The caller supplies a live initialized EFI system table and serializes boot-services use. The
-   library validates the image, captures bounded firmware RT variables, allocates the runtime index,
-   copies and seals position-independent readers into `EfiRuntimeServicesCode`, installs a private
-   `EfiRuntimeServicesData` table at `SystemTable.RuntimeServices`, and updates table CRCs. It
-   publishes `EFI_RT_PROPERTIES_TABLE`, and corrects the copied-code range's execute attribute in
-   the firmware Memory Attributes Table. The report callback receives boot-time publication events;
-   it is never called by the runtime readers. Installation fails before use if preparation is invalid.
-3. **Boot-services operation (library).** Managed NV updates use `persist::apply`; success includes
-   ordered flushes and readback. Managed volatile values stay in RAM. Forwarded get/set operations
-   use the original firmware function pointers. Enumeration suppresses shadowed firmware namespaces.
-   Every accepted mutation rebuilds the prepared runtime index, including forwarded firmware updates.
-   BS-only values remain available before EBS but are excluded from the runtime index. Application
-   helpers `get`, `set` and `delete_durable` operate on managed namespaces; the last independently
-   reloads the backend after deletion to verify absence.
+1. **Manifest (consumer).** Discover and validate the partition. Supply `backend::Manifest`
+   (size, initial checkpoint capacity, physical write unit, unique GPT GUID), a
+   `service::BlockBackend` implementing `backend::Storage` (primary `Read`/`Write`/`Flush`
+   plus independently flushed migration-journal I/O), a namespace `Policy`, a verifier and
+   anchor. Journal pathname/lifecycle, project/BLI GUIDs, size, logging and trail marks are
+   consumer policy. Absent journal reads are zero; create/extend happens only on journal writes.
+2. **Install at application start, before any variable consumers or children.** Call
+   `VariableService::install(table, backend, manifest, policy, verifier, anchor, report)`.
+   Only one installation is permitted. A blank/unrecognized partition is initialized as
+   EFVS; an edk2 image is imported once through the transaction below. An EFVS image loads
+   its highest valid generation and replays its log under the caller's `efvs::Verifier`.
+   The official caller supplies `PolicyNone` and `NoneAnchor`: no key enrollment, setup mode,
+   no cryptographic authenticity or protected rollback guarantee.
+   Replay checks the anchor, durably compacts the accepted state and torn/rejected tail,
+   independently reads it back, then bumps/locks the anchor **before publication and EBS**.
+   The library captures bounded original-firmware RT variables, prepares the runtime index,
+   copies/seals the runtime readers, installs a private gRT and refreshes CRCs. It publishes
+   `EFI_RT_PROPERTIES_TABLE` and a runtime-owned EFVS configuration table under
+   `930e89ed-540e-4af0-9b41-c2c559939d50` (unique partition GUID, tier 0, capabilities,
+   committed anchor value), and corrects copied-code execute attributes.
+3. **Boot-services operation.** Every downstream consumer uses ordinary gRT
+   GetVariable/GetNextVariableName/SetVariable/QueryVariableInfo, not raw image access.
+   Managed NV|BS|RT updates append checked EFVS SET/APPEND/DELETE records, flush and read
+   back before publication. Authorized firmware-only NV|BS variables use A/B checkpoint
+   compaction, never bypass runtime log admission rules. Volatile values remain in RAM.
+   Other namespaces forward to saved firmware callbacks; enumeration suppresses shadowed
+   namespaces. Every successful mutation rebuilds the runtime index. BS-only variables
+   are excluded from that index. `inspect()` reports generation/log usage/posture without
+   handing consumers the backing bytes. There is no private application get/set shortcut.
 4. **ExitBootServices (library notification).** Installation arms an EBS-group notification. It
    swaps the four variable entries to the copied runtime thunks and refreshes the private table CRC.
    The index is already prepared: no allocation, filesystem access or block I/O occurs in this
@@ -44,20 +51,39 @@ owned state; dropping the owner also attempts restoration. Never restore or drop
 successful EBS. Retain/leak the owner across that handoff. The application must not unload itself
 while its pre-EBS callbacks or EBS event remain installed.
 
-## EFVS lifecycle integration boundary
+## First-boot migration and recovery
 
-The owner's deferred-verification EFVS container is a subsequent format/backend integration,
-not implemented by this behavior-preserving extraction. Today `BlockBackend` abstracts byte I/O
-while `variables::Service` uses the edk2 engine; adopting EFVS also requires replacing that
-boot-time store adapter, not merely pointing this parser at an EFVS partition.
+The primary is never overwritten until the independent journal contains a complete,
+flushed, byte-verified EFVS image plus a committed marker (size, image SHA-256 and marker
+SHA-256). The journal has a 4096-byte marker page followed by the full image. Both initial
+checkpoint slots contain the imported live state: a damaged header must not fall back to
+an empty store. Import failure (including insufficient checkpoint space) leaves the
+original image untouched.
 
-Boot-time load/replay/verification/compaction belongs before preparing and publishing the runtime
-index, while storage and verification primitives are available. A future EFVS configuration table
-belongs alongside runtime-properties publication during installation, using runtime-owned data
-and the same reverse-restore lifecycle. Freshness-anchor bump/lock belongs after successful durable
-compaction and **before EBS** (or before publication when required by the platform's milestone).
-It must not add storage/crypto/anchor work to the allocation-free EBS notification or runtime thunks.
-The current crate does not publish a pretend EFVS table or claim an anchor was locked.
+The service writes/verifies the complete body, then each whole physical header block,
+with a flush after every write. A committed journal resumes an interrupted conversion,
+including completing the second pair after the first header was published. Before any
+EFI callbacks or subsequent mutations are exposed, the marker is zeroed, flushed and
+read back. Thus a retained journal body is inert and cannot later roll back an EFVS
+store. A normal EFVS boot needs no full-image ESP mirror: its A/B checkpoints and append
+log own recovery. A stale legacy spare is never treated as an authoritative migration
+source.
+
+Host tests interrupt every journal/primary write and flush, including partial marker
+prefixes and representative body/header tears, then restart the actual service. They
+also cover OS log replay on the next boot, torn-tail compaction, anchor lock and
+firmware-only BS variables. These are logical storage-order tests, not proof that a
+particular firmware filesystem or BlockIo flush is honest.
+
+## OS discovery
+
+The EFVS table describes the store to EFI consumers. An out-of-tree Linux module cannot
+depend on an unknown EFI configuration table surviving kernel initialization. Consumers
+such as Surfacer additionally publish `/chosen/efivar-store,partuuid` as a NUL-terminated
+canonical lowercase unique GPT GUID through their DT fixup path. This is consumer
+publishing policy; both the GBL Android DT and native EFI_DT_FIXUP path need it. The Linux
+backend uses the kernel's efivars/efivarfs machinery; it does not modify the frozen EFI
+runtime index.
 
 ## Physical runtime, not virtual relocation
 
@@ -87,8 +113,11 @@ GBL path does not hand the system table to the kernel. Device proof is outside t
 - Current bounds are 256 UTF-16 name units (including termination), 64 KiB values, 64 KiB volatile
   overlay, 512 runtime variables and a 2 MiB index. Firmware capture is separately bounded at 256
   variables / 512 KiB. An arbitrary backend size does not imply unlimited runtime snapshot capacity.
-- Authenticated and append writes remain rejected. This component neither enrolls Secure Boot keys
-  nor supplies a crypto verifier or anti-rollback service.
+- Append writes are supported for persistent runtime-visible variables. Policy None rejects
+  authenticated updates; caller-supplied verification/anchor interfaces are real admission
+  boundaries, while production crypto/secure-storage primitives remain explicitly unsupported.
+  The current once-per-boot anchor is locked at installation; later unauthenticated boot writes
+  do not claim freshness, and authenticated state is reconciled at the next boot.
 - The `lab` feature exposes placement/proof wiring used by consumers' boot instruments. The library
   owns the mechanism; diagnostic markers, synthetic proof variables and persistence policy remain
   consumer code.
