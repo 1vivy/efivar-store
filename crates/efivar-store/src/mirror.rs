@@ -1,6 +1,6 @@
 //! Offline primary/spare selection. A valid primary always wins, even when the
 //! spare is also valid: the spare is a previous pre-boot snapshot, not a journal.
-use crate::Store;
+use super::Store;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Decision {

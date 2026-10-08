@@ -1,5 +1,5 @@
+use super::super::sha256::Sha256;
 use super::*;
-use crate::sha256::Sha256;
 pub const CHECKPOINT_HEADER_SIZE: usize = 96;
 pub const VARIABLE_HEADER_SIZE: usize = 48;
 #[derive(Clone, Copy, Debug)]

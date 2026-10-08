@@ -3,6 +3,4 @@
 
 #[allow(unused_attributes)]
 #[path = "../src/lib.rs"]
-mod engine;
-
-pub use engine::*;
+pub mod engine;

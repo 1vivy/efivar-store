@@ -72,7 +72,7 @@
 //! # Ok::<(), efivar_store::auth::Error>(())
 //! ```
 
-use crate::Guid;
+use super::Guid;
 
 /// `EFI_VARIABLE_NON_VOLATILE`: retained across power cycles.
 pub const NON_VOLATILE: u32 = 0x0000_0001;
