@@ -1,0 +1,7 @@
+# The core crate compiles on stable; the gobbl workspace pinned a nightly for its UEFI
+# `-Zbuild-std` lanes, which this repository does not need.
+[toolchain]
+channel = "stable"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
+targets = ["thumbv7em-none-eabihf"]

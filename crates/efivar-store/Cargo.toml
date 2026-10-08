@@ -1,0 +1,24 @@
+[package]
+name = "efivar-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "edk2-compatible EFI variable store on a block device: no_std, allocation-free byte-image engine"
+repository = "https://github.com/1vivy/efivar-store"
+keywords = ["efi", "uefi", "variable", "no_std", "edk2"]
+categories = ["no-std", "embedded"]
+
+[lib]
+name = "efivar_store"
+
+[features]
+default = []
+# Host OS adapter (`persist::unix`) with flock, block-device sizing and fsync.
+# Firmware never enables it: the engine itself stays no_std and allocation-free.
+std = []
+
+[dependencies]
+
+[lints]
+workspace = true
