@@ -70,7 +70,8 @@ let store = Store::parse(&image)?;
 assert_eq!(store.free_space(), store.capacity());
 
 // Durable update over a caller-supplied device (`persist::apply`) or the Unix adapter:
-let mut device = efivar_store::persist::unix::Device::open(std::path::Path::new("/dev/disk/by-partlabel/bdsvars"))?;
+// the partition name, size and GUID are the consumer's choice, not this crate's.
+let mut device = efivar_store::persist::unix::Device::open(std::path::Path::new("/dev/disk/by-partlabel/efivars"))?;
 let name: Vec<u16> = "LoaderEntryDefault".encode_utf16().collect();
 let guid = [0x82, 0xb0, 0x67, 0x4a, 0x4c, 0x0a, 0xcf, 0x41, 0xb6, 0xc7, 0x44, 0x0b, 0x29, 0xbb, 0x8c, 0x4f];
 let outcome = device.transaction(|tx| tx.set(&name, &guid, 0x7, b"linux\0".as_slice()))?;
