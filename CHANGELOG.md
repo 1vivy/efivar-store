@@ -20,6 +20,10 @@
 - Add EFVS v1 as the live container, leaving edk2 APIs unchanged for interoperability.
   Shared no_std, allocation-free codecs, SHA-256, ordered replay, torn-tail recovery,
   explicit compaction, edk2 migration, configuration table and anchor interfaces.
+- Make EFVS compaction crash-atomic with two block-aligned checkpoint slots and
+  generation/CRC header copies in distinct physical write units. Add the shared
+  ordered compaction I/O interface, highest-valid-generation recovery, and
+  exhaustive torn-checkpoint/header plus write/flush and 4Kn-sector fault tests.
 - Add EFVS CLI init/inspect/list/get/set/delete/oneshot, offline compact and import-edk2.
 - Official Policy None rejects authenticated updates; anchor/crypto primitives remain
   explicit unsupported stubs except the real no-persistence NoneAnchor.

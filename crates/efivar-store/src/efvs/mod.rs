@@ -16,7 +16,7 @@ pub type Guid = [u8; 16];
 pub type Timestamp = [u8; 16];
 pub const VERSION: u16 = 1;
 pub const PHONE_SIZE: usize = 1024 * 1024;
-pub const PHONE_CHECKPOINT_CAPACITY: usize = 256 * 1024;
+pub const PHONE_CHECKPOINT_CAPACITY: usize = 128 * 1024;
 pub const ATTR_TIME_AUTH: u32 = 0x20;
 pub const ATTR_APPEND: u32 = 0x40;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

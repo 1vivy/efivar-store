@@ -45,11 +45,11 @@ options:
   --device PATH      block device or partition holding the store (read-write)
   --image PATH       store image file; same format and same commands
   --size BYTES       `init`: image size, a multiple of --block
-  --block BYTES      `init`: erase block size (default 4096)
+  --block BYTES      `init`: physical write unit for EFVS, erase block for edk2 (default 4096)
   --layout LAYOUT    `init`: normal or auth (default auth)
   --force            `init`: overwrite an existing image file
   --efvs             `init`: EFVS v1 live container (otherwise edk2 interop FV)
-  --checkpoint BYTES EFVS checkpoint capacity (default 262144)
+  --checkpoint BYTES EFVS capacity per checkpoint slot (default 131072; two slots)
   --from PATH        `import-edk2`: source edk2 image
   --name N           variable name; UTF-8 here, UTF-16LE on disk
   --guid G           EFI GUID in UUID text form, e.g. 4a67b082-0a4c-41cf-b6c7-440b29bb8c4f

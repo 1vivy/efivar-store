@@ -18,12 +18,31 @@ boot/offline compaction before appending; full capacity returns `Full`, never re
 These guarantees assume writes do not damage earlier already-durable bytes.
 The hash chain detects damage/order, not hostile rewriting or boundary truncation.
 
-Compaction is different: write/flush the new checkpoint, zero/flush the log,
-then bump (if greater) and lock the anchor. An interruption while rewriting the
-single checkpoint may invalidate it; a platform wanting compaction atomicity needs
-a durable spare or journal. `compact` computes bytes but performs no I/O.
-The host compact command is offline image-only. SHA-256 of the checkpoint and
-its serialized counter do not establish provenance; see the
+EFVS compaction is crash-atomic using A/B checkpoint slots and two headers in
+**different physical write units**, each with generation and CRC. The phone
+profile uses 4096-byte blocks (headers at 0/4096), two 128 KiB checkpoint slots
+and a shared 778240-byte log in the 1 MiB image.
+`compact_durable` writes the inactive checkpoint and flushes, writes the inactive
+header's complete physical block and flushes, then zeroes the log and flushes.
+Only after this sequence succeeds may the caller bump (if greater) and lock its anchor.
+
+Load selects the highest-generation header with a valid CRC and referenced
+checkpoint SHA-256, falling back to the other pair. Before header commitment the
+old checkpoint plus log recover the pre-compaction state; afterwards the new
+checkpoint recovers the post-compaction state. Stale log records cannot replay
+against a different checkpoint hash/sequence. Interrupted clearing is finished
+before further append. Header discovery still finds B when A's entire block is lost.
+
+Tests inject failure at every write/flush call, both outcomes of failed flushes,
+every byte offset of a torn checkpoint/header write in both directions, and
+damage to an entire 4 KiB target sector. These guarantees assume flush ordering
+is honored and torn writes cannot corrupt unrelated physical write units;
+consumers must select a block size at least their medium's physical write unit.
+An arbitrary subsequent corruption may fall back to an older checkpoint, not
+reconstruct an already-cleared historical log. `compact` only stages bytes;
+writing its whole result at once would violate the ordered contract.
+The host compact command uses `compact_durable` and remains offline image-only.
+SHA-256 and redundant headers do not establish checkpoint provenance; see the
 [spec correction](efvs-v1.md#spec-correction-checkpoint-provenance).
 
 ## edk2: ordered phase durability

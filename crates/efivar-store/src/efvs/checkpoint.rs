@@ -272,13 +272,80 @@ impl<'a> State<'a> {
         Ok(())
     }
 }
-/// Pure image compaction. Caller must persist checkpoint, clear log, then bump/lock anchor.
+/// Stage crash-safe A/B compaction in memory. For actual I/O use
+/// `compact_durable`, which preserves the required checkpoint/header/log barriers.
+/// Repeating compaction of an already clean checkpoint is byte-identical.
 pub fn compact(image: &mut [u8], state: &State<'_>) -> Result<u64, Error> {
     let h = Header::decode(image)?;
     if state.bytes.len() != h.checkpoint_capacity {
         return Err(Error::Bounds);
     }
-    state.encode_checkpoint(&mut image[h.checkpoint_offset..h.log_offset])?;
+    let region = &image[h.checkpoint_range()];
+    let cp = Checkpoint::decode(region)?;
+    let unchanged = cp.used == state.used
+        && cp.next_sequence == state.next_sequence
+        && cp.authenticated_count == state.authenticated_count
+        && region[CHECKPOINT_HEADER_SIZE..] == state.bytes[CHECKPOINT_HEADER_SIZE..];
+    if !unchanged {
+        let mut next = h.inactive();
+        next.generation = h.generation.checked_add(1).ok_or(Error::Bounds)?;
+        state.encode_checkpoint(&mut image[next.checkpoint_range()])?;
+        image[next.header_range()].fill(0);
+        next.encode(&mut image[next.header_range()])?;
+    }
     image[h.log_offset..].fill(0);
     Ok(state.authenticated_count)
+}
+
+/// Ordered compaction sink. Flush must make all preceding writes durable.
+/// Header blocks occupy distinct physical write units: callers must use geometry
+/// whose block_size is at least their device's actual physical write unit.
+pub trait CompactionIo {
+    type Error;
+    fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), Self::Error>;
+    fn flush(&mut self) -> Result<(), Self::Error>;
+}
+
+#[derive(Debug)]
+pub enum CompactionError<E> {
+    Format(Error),
+    Io(E),
+}
+impl<E: core::fmt::Display> core::fmt::Display for CompactionError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Format(error) => write!(f, "{error}"),
+            Self::Io(error) => write!(f, "{error}"),
+        }
+    }
+}
+impl<E: core::error::Error + 'static> core::error::Error for CompactionError<E> {}
+
+/// Commit inactive checkpoint -> flush -> inactive header block -> flush ->
+/// zero log -> flush. The previous pair is never written before the new pair
+/// is durable. Only after success may the caller bump/lock its freshness anchor.
+/// An I/O error invalidates the staged image: reload it before reuse.
+pub fn compact_durable<I: CompactionIo>(
+    image: &mut [u8],
+    state: &State<'_>,
+    io: &mut I,
+) -> Result<u64, CompactionError<I::Error>> {
+    let old = Header::decode(image).map_err(CompactionError::Format)?;
+    let log_dirty = image[old.log_offset..].iter().any(|b| *b != 0);
+    let value = compact(image, state).map_err(CompactionError::Format)?;
+    let new = Header::decode(image).map_err(CompactionError::Format)?;
+    if old.generation != new.generation {
+        io.write_at(new.checkpoint_offset, &image[new.checkpoint_range()])
+            .map_err(CompactionError::Io)?;
+        io.flush().map_err(CompactionError::Io)?;
+        io.write_at(new.header_offset, &image[new.header_range()])
+            .map_err(CompactionError::Io)?;
+        io.flush().map_err(CompactionError::Io)?;
+    }
+    if old.generation != new.generation || log_dirty {
+        io.write_at(new.log_offset, &image[new.log_offset..])
+            .map_err(CompactionError::Io)?;
+        io.flush().map_err(CompactionError::Io)?;
+    }
+    Ok(value)
 }

@@ -1,9 +1,13 @@
 # efivar-store
 
 **Status (2026-10-07)** — EFVS v1 is the live block-backed EFI variable container:
-a checkpoint plus a hash-chained append log, with shared allocation-free `no_std`
+A/B checkpoints plus a hash-chained append log, with shared allocation-free `no_std`
 serializers and replay for firmware and Linux. The existing edk2 FV engine remains
 unchanged for import/export, inspection and migration of existing stores.
+Compaction writes the inactive checkpoint and its generation/CRC header, with
+flush barriers before clearing the log. Header copies occupy distinct physical
+write units (4096 bytes by default), so a torn sector cannot destroy both.
+The 1 MiB phone profile reserves two 128 KiB checkpoint slots and a 778240-byte log.
 
 The official Secure Boot policy is **None**: no root keys, SecureBoot=0, tier 0.
 Authenticated writes are refused, not silently accepted by a crypto stub.

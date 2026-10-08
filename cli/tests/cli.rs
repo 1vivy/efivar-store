@@ -389,6 +389,10 @@ fn efvs_cli_roundtrip_compact_and_import() {
     let inspect = ok(&run(&["--image", path, "inspect"]));
     assert!(inspect.contains("format: EFVS v1"));
     assert!(inspect.contains("tier: 0"));
+    let mut damaged = std::fs::read(&image).unwrap();
+    damaged[..4096].fill(0xa5);
+    std::fs::write(&image, damaged).unwrap();
+    assert!(ok(&run(&["--image", path, "inspect"])).contains("header offset: 4096"));
     let data = dir.join("data");
     std::fs::write(&data, b"first").unwrap();
     ok(&run(&[

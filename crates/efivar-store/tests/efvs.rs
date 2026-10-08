@@ -4,7 +4,7 @@ fn name(s: &str) -> Vec<u8> {
 }
 fn image() -> Vec<u8> {
     let mut v = vec![0; 4096];
-    initialize(&mut v, 1024).unwrap();
+    initialize_with_block(&mut v, 1024, 512).unwrap();
     v
 }
 fn input<'a>(n: &'a [u8], data: &'a [u8], operation: Operation) -> RecordInput<'a> {
@@ -22,7 +22,7 @@ fn input<'a>(n: &'a [u8], data: &'a [u8], operation: Operation) -> RecordInput<'
 }
 fn raw_append(image: &mut [u8], input: RecordInput<'_>) -> core::ops::Range<usize> {
     let h = Header::decode(image).unwrap();
-    let cp = Checkpoint::decode(&image[h.checkpoint_offset..h.log_offset]).unwrap();
+    let cp = Checkpoint::decode(&image[h.checkpoint_range()]).unwrap();
     let mut log = Log::new(&image[h.log_offset..], cp.hash, cp.next_sequence);
     for _ in log.by_ref() {}
     let start = h.log_offset + log.consumed;
@@ -36,10 +36,15 @@ fn codecs_and_phone_geometry() {
     let mut image = vec![0; PHONE_SIZE];
     initialize(&mut image, PHONE_CHECKPOINT_CAPACITY).unwrap();
     let h = Header::decode(&image).unwrap();
-    assert_eq!(h.log_offset, 262208);
-    assert_eq!(h.log_capacity, 786368);
+    assert_eq!(h.block_size, 4096);
+    assert_eq!(h.checkpoint_offset, 8192);
+    assert_eq!(h.checkpoint_capacity, 131072);
+    assert_eq!(h.log_offset, 270336);
+    assert_eq!(h.log_capacity, 778240);
     assert_eq!(
-        Checkpoint::decode(&image[64..h.log_offset]).unwrap().count,
+        Checkpoint::decode(&image[h.checkpoint_range()])
+            .unwrap()
+            .count,
         0
     );
     let mut header = [0; 64];
@@ -316,16 +321,16 @@ fn anchors_stubs_none_and_posture() {
 }
 #[test]
 fn capacity_failure_preserves_image_and_state() {
-    let mut image = vec![0; 256];
-    initialize(&mut image, 96).unwrap();
-    let mut scratch = [0; 96];
+    let mut image = vec![0; 4096];
+    initialize_with_block(&mut image, 512, 512).unwrap();
+    let mut scratch = [0; 512];
     let mut r = replay(&image, &mut scratch, &mut PolicyNone, 0).unwrap();
     let before = image.clone();
     let n = name("key");
     assert_eq!(
         append(
             &mut image,
-            input(&n, b"x", Operation::Set),
+            input(&n, &[1; 500], Operation::Set),
             &mut r.state,
             &mut PolicyNone
         ),
@@ -333,8 +338,8 @@ fn capacity_failure_preserves_image_and_state() {
     );
     assert_eq!(image, before);
     assert_eq!(r.state.variables().count(), 0);
-    let mut image = vec![0; 1200];
-    initialize(&mut image, 1024).unwrap();
+    let mut image = vec![0; 3072];
+    initialize_with_block(&mut image, 1024, 512).unwrap();
     let before = image.clone();
     let mut scratch = [0; 1024];
     let mut r = replay(&image, &mut scratch, &mut PolicyNone, 0).unwrap();
@@ -371,11 +376,11 @@ fn edk2_fixture_import_parity_both_layouts() {
                 b"new",
             )
             .unwrap();
-        let mut image = image();
-        let mut scratch = [0; 1024];
-        let count = migrate::import_edk2(&source, &mut image, 1024, &mut scratch).unwrap();
+        let mut image = vec![0; 32768];
+        let mut scratch = [0; 4096];
+        let count = migrate::import_edk2(&source, &mut image, 4096, &mut scratch).unwrap();
         let h = Header::decode(&image).unwrap();
-        let cp = Checkpoint::decode(&image[64..h.log_offset]).unwrap();
+        let cp = Checkpoint::decode(&image[h.checkpoint_range()]).unwrap();
         assert_eq!(count, Store::parse(&source).unwrap().list().count());
         for old in Store::parse(&source).unwrap().list() {
             let new = cp
@@ -427,10 +432,15 @@ fn valid_hash_wrong_chain_and_existing_bs_only_are_rejected() {
 fn malformed_headers_checkpoints_and_zero_auth_time_fail_closed() {
     let mut image = image();
     image[48] ^= 1;
-    assert_eq!(Header::decode(&image), Err(Error::Checksum));
+    assert_eq!(Header::decode(&image).unwrap().header_offset, 512);
+    image[512 + 48] ^= 1;
+    assert_eq!(Header::decode(&image), Err(Error::Header));
+    image[512 + 48] ^= 1;
     image[48] ^= 1;
-    image[100] ^= 1;
-    assert!(Checkpoint::decode(&image[64..1088]).is_err());
+    let h = Header::decode(&image).unwrap();
+    image[h.checkpoint_offset + 40] ^= 1;
+    assert!(Checkpoint::decode(&image[h.checkpoint_range()]).is_err());
+    assert_eq!(Header::decode(&image).unwrap().header_offset, 512);
     let n = name("private");
     let mut bytes = [0; 1024];
     let mut state = State::empty(&mut bytes).unwrap();

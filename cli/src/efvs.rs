@@ -17,7 +17,17 @@ pub fn detect(args: &Args) -> Result<bool, Failure> {
     let mut f = File::open(args.backing()?).map_err(fail)?;
     let mut magic = [0; 4];
     f.read_exact(&mut magic).map_err(fail)?;
-    Ok(magic == *b"EFVS")
+    if magic == *b"EFVS" {
+        return Ok(true);
+    }
+    let mut block = MIN_BLOCK_SIZE;
+    while block <= MAX_BLOCK_SIZE {
+        if f.read_exact_at(&mut magic, block as u64).is_ok() && magic == *b"EFVS" {
+            return Ok(true);
+        }
+        block *= 2;
+    }
+    Ok(false)
 }
 pub fn create(args: &Args) -> Result<(), Failure> {
     if args.value("--device").is_some() {
@@ -26,15 +36,21 @@ pub fn create(args: &Args) -> Result<(), Failure> {
     let path = args.required("--image")?;
     let size = number(args, "--size", None)?;
     let capacity = number(args, "--checkpoint", Some(PHONE_CHECKPOINT_CAPACITY))?;
+    let block = number(args, "--block", Some(DEFAULT_BLOCK_SIZE))?;
     let mut image = vec![0; size];
     if args.command()? == "import-edk2" {
+        if block != DEFAULT_BLOCK_SIZE {
+            return Err(Failure::Usage(
+                "import-edk2 uses 4096-byte physical blocks".into(),
+            ));
+        }
         let source = std::fs::read(args.required("--from")?).map_err(fail)?;
         let mut scratch = vec![0; capacity];
         let count = efivar_store::migrate::import_edk2(&source, &mut image, capacity, &mut scratch)
             .map_err(fail)?;
         println!("imported {count} variables (policy filtering occurs at replay)");
     } else {
-        initialize(&mut image, capacity).map_err(fail)?;
+        initialize_with_block(&mut image, capacity, block).map_err(fail)?;
     }
     let file = OpenOptions::new()
         .write(true)
@@ -48,9 +64,19 @@ pub fn create(args: &Args) -> Result<(), Failure> {
     file.write_all_at(&image, 0).map_err(fail)?;
     file.sync_all().map_err(fail)?;
     println!(
-        "initialised {path}: {size} bytes, EFVS v1, checkpoint {capacity}, tier 0, SecureBoot=0"
+        "initialised {path}: {size} bytes, EFVS v1, two {capacity}-byte checkpoints, block {block}, tier 0, SecureBoot=0"
     );
     Ok(())
+}
+struct CompactionFile<'a>(&'a File);
+impl CompactionIo for CompactionFile<'_> {
+    type Error = std::io::Error;
+    fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.0.write_all_at(bytes, offset as u64)
+    }
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.0.sync_all()
+    }
 }
 fn wire_name(name: &[u16]) -> Vec<u8> {
     name.iter().flat_map(|u| u.to_le_bytes()).collect()
@@ -85,12 +111,18 @@ pub fn run(args: &Args) -> Result<(), Failure> {
     let mut image = vec![0; size];
     file.read_exact_at(&mut image, 0).map_err(fail)?;
     let header = Header::decode(&image).map_err(fail)?;
-    let cp =
-        Checkpoint::decode(&image[header.checkpoint_offset..header.log_offset]).map_err(fail)?;
+    let cp = Checkpoint::decode(&image[header.checkpoint_range()]).map_err(fail)?;
     let mut scratch = vec![0; header.checkpoint_capacity];
     let mut replay = replay(&image, &mut scratch, &mut PolicyNone, 0).map_err(fail)?;
     match command {
         "inspect" => {
+            println!(
+                "header offset: {}\ngeneration: {}\nphysical block: {}\ncheckpoint offset: {}\ncheckpoint slots: 2",
+                header.header_offset,
+                header.generation,
+                header.block_size,
+                header.checkpoint_offset
+            );
             println!(
                 "format: EFVS v1\nsize: {size} bytes\ncheckpoint capacity: {}\ncheckpoint used: {}\ncheckpoint variables: {}\ncheckpoint next sequence: {}\ncheckpoint authenticated count: {}\ncheckpoint SHA-256: {}\nlog offset: {}\nlog capacity: {}\nlog used: {}\nlog end: {:?}\naccepted records: {}\nrejected records: {}\nlive variables: {}\ntier: 0\nSecureBoot: 0\nanchor: NONE",
                 header.checkpoint_capacity,
@@ -138,17 +170,8 @@ pub fn run(args: &Args) -> Result<(), Failure> {
             }
         }
         "compact" => {
-            let value = compact(&mut image, &replay.state).map_err(fail)?;
-            // Crash during checkpoint rewrite is not append-atomic; this command is offline.
-            file.write_all_at(
-                &image[header.checkpoint_offset..header.log_offset],
-                header.checkpoint_offset as u64,
-            )
-            .map_err(fail)?;
-            file.sync_all().map_err(fail)?;
-            file.write_all_at(&image[header.log_offset..], header.log_offset as u64)
+            let value = compact_durable(&mut image, &replay.state, &mut CompactionFile(&file))
                 .map_err(fail)?;
-            file.sync_all().map_err(fail)?;
             commit_anchor(&mut NoneAnchor::new(), value).map_err(fail)?;
             println!("compacted: authenticated count {value}, tier 0");
         }

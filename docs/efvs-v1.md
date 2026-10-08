@@ -1,6 +1,6 @@
 # EFVS v1: block-backed EFI variables
 
-EFVS is the live container: a firmware checkpoint and an append-only runtime log.
+EFVS is the live container: redundant firmware checkpoints and an append-only runtime log.
 The existing edk2 FV engine is unchanged and remains the import/export/inspection
 and migration interoperability engine. An edk2 FV is not an EFVS checkpoint.
 All serializers live in `efivar_store::efvs`; firmware and Linux compile the same
@@ -24,11 +24,24 @@ endianness are used. All regions and records are 8-byte aligned. All unused byte
 reserved fields and padding are zero. Unknown versions/flags are refused, never
 silently ignored. Length arithmetic is checked before indexing caller buffers.
 
-Phone profile: 1,048,576-byte image, 64-byte header, 262,144-byte checkpoint at
-64, log at 262,208 with 786,368 bytes capacity. The checkpoint capacity includes
-its 96-byte header. Sizes are caller-selected, not inferred from partition type.
+Phone profile: 1,048,576-byte image, 4096-byte physical write units, header A at
+0 and header B at 4096 (each a 64-byte structure in its own zero-padded block).
+Checkpoint A is at 8192, checkpoint B at 139264, each with 131072-byte capacity
+(256 KiB total checkpoint reservation, 128 KiB usable slot budget including its
+96-byte header). The shared log begins at 270336 and has 778240 bytes capacity.
+Header blocks, checkpoint starts/capacities and log start are physical-block aligned.
+Sizes are caller-selected, not inferred from partition type.
 
-### Image header (64 bytes)
+Block size is a power of two from 512 through 65536, defaults to 4096, and must
+be at least the device's actual physical write unit. Consumers must reject a
+geometry smaller than their device write unit. Two structures at offsets 0/64
+would share a physical sector and are explicitly **not** this format. Header B
+is always one recorded block from zero. To recover when header A is destroyed,
+decoders try the bounded supported block-size positions for B and validate its
+recorded geometry, CRC and checkpoint. Image size and each slot capacity must
+be multiples of block size; each slot occupies at least one block.
+
+### Image headers A/B (64 bytes each, in separate physical blocks)
 
 | Offset | Width | Field |
 | --- | --- | --- |
@@ -36,18 +49,24 @@ its 96-byte header. Sizes are caller-selected, not inferred from partition type.
 | 4 | 2 | version = 1 |
 | 6 | 2 | header size = 64 |
 | 8 | 8 | exact image size |
-| 16 | 8 | checkpoint offset = 64 |
-| 24 | 8 | checkpoint capacity, at least 96, multiple of 8 |
-| 32 | 8 | log offset = checkpoint offset + capacity |
+| 16 | 8 | referenced checkpoint offset: `2*block_size` for A, plus one capacity for B |
+| 24 | 8 | capacity of **each** checkpoint slot, block-aligned |
+| 32 | 8 | shared log offset = `2*block_size + 2*checkpoint_capacity` |
 | 40 | 8 | log capacity; log end must equal image size |
 | 48 | 4 | CRC32 |
-| 52 | 12 | reserved zero (future format flags/extensions) |
+| 52 | 4 | physical block size |
+| 56 | 8 | monotonically increasing compaction generation |
 
 CRC32 is reflected IEEE CRC-32: polynomial 0xedb88320, initial/final XOR
 0xffffffff, over **all 64 header bytes with bytes 48..52 zeroed**. It is only
 corruption detection. Image length must match, not merely contain, header geometry.
+The remainder of each physical header block is zero. Initialization creates both
+valid pairs at generation zero; ties prefer header A. Load chooses the highest
+generation with both a valid header CRC/geometry and a valid referenced checkpoint
+SHA-256/structure, falling back to the other pair. Generation overflow is refused.
+Neither the CRC nor the generation authenticates data against a malicious writer.
 
-### Checkpoint (fixed reserved capacity)
+### Checkpoint slots A/B (equal fixed reserved capacity)
 
 | Offset | Width | Field |
 | --- | --- | --- |
@@ -204,15 +223,35 @@ returning typed `Unsupported` for every operation and advertising no capability.
 Qualcomm's reserved rollback index is 31; no device I/O or milestone is implemented.
 `commit_anchor` only bumps after durable data writes and then locks before EBS.
 
-Compaction: replay into caller scratch, reject rollback, encode the new checkpoint
-with resulting state, next sequence and cumulative auth count; persist and flush
-that checkpoint; zero and flush the entire log; then bump (only if greater) and
-lock the anchor. `compact` is the pure image step; the returned u64 is the new
-anchor value, **not** old anchor plus the already cumulative count. Checkpoint
-rewrites are not atomic: power loss during compaction may require fallback or a
-platform spare/journal. The append torn-write guarantee does not cover compaction.
-No verified write is published until its record is durably appended and flushed;
-a caller whose I/O fails must discard/reload its tentative working set.
+Compaction first replays into caller scratch and rejects rollback. `compact_durable`
+then implements the only supported persistence order:
+
+1. Encode the resulting state, next sequence and cumulative authenticated count into
+   the **inactive** checkpoint slot. Write that complete aligned slot and flush.
+2. Encode the inactive header with generation `active + 1`, referring to that slot.
+   Write its **entire physical header block** (64 bytes plus zero padding), then flush.
+   The old active header/checkpoint pair has not been touched.
+3. Zero the shared log and flush it. Only then bump (if greater) and lock the anchor.
+
+Before the new header is durable, the old pair and original log recover the
+pre-compaction state. Afterwards the new checkpoint recovers the post-compaction
+state. A stale or partly erased old log has the old checkpoint's link/sequence and
+terminates immediately; it cannot be applied on top of the new checkpoint.
+Interrupted log clearing is finished by the next boot compaction before appending.
+No scan past a bad first record is permitted. If the working checkpoint is already
+identical, compaction preserves the generation and only clears a dirty log; a clean
+no-op writes nothing and remains byte-identical.
+
+`compact` stages the final image without I/O; callers must not persist it as a
+whole-image write. `CompactionIo` and `compact_durable` share the above write/flush
+order between firmware and host. The returned u64 is the cumulative new anchor
+value, **not** old anchor plus that already cumulative count. A failed I/O invalidates
+the tentative staging image; reload before reuse. The guarantees require honest
+flush barriers and a torn write that damages only its addressed physical write units.
+An arbitrary later corruption can recover an older checkpoint but does not promise
+that its already-cleared historical log is still available. This is crash atomicity,
+not indefinite redundant history or checkpoint authentication.
+No verified runtime write is published until its record has been appended and flushed.
 
 Nominal source tiers are 0=no protected freshness, 1=boot-time monotonic freshness,
 2=runtime monotonic freshness. **All current code reports tier 0**, even if supplied

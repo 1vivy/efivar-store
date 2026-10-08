@@ -181,7 +181,7 @@ pub fn replay<'a>(
     anchor: u64,
 ) -> Result<Replay<'a>, Error> {
     let h = Header::decode(image)?;
-    let region = &image[h.checkpoint_offset..h.log_offset];
+    let region = &image[h.checkpoint_range()];
     let cp = Checkpoint::decode(region)?;
     let mut state = State::from_checkpoint(region, scratch)?;
     // Policy filtering applies to imported/offline-created checkpoints too.
@@ -231,7 +231,7 @@ pub fn append(
     verifier: &mut impl Verifier,
 ) -> Result<core::ops::Range<usize>, Error> {
     let h = Header::decode(image)?;
-    let cp = Checkpoint::decode(&image[h.checkpoint_offset..h.log_offset])?;
+    let cp = Checkpoint::decode(&image[h.checkpoint_range()])?;
     let mut log = Log::new(&image[h.log_offset..], cp.hash, cp.next_sequence);
     for _ in log.by_ref() {}
     if log.end == LogEnd::Torn {
