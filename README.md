@@ -1,15 +1,34 @@
 # efivar-store
 
-**Status (2026-10-07)** — extracted from the gobbl boot stack (`gobbl@ec63674`, where it was
-`crates/varstore` + `tools/bdsvars`). The core engine and the Unix adapter are host-tested; the
-formatter creates a standalone NV FV, and FTW (fault-tolerant write) maintenance is not implemented.
+**Status (2026-10-07)** — EFVS v1 is the live block-backed EFI variable container:
+a checkpoint plus a hash-chained append log, with shared allocation-free `no_std`
+serializers and replay for firmware and Linux. The existing edk2 FV engine remains
+unchanged for import/export, inspection and migration of existing stores.
 
-edk2-compatible EFI variable storage on a block device or partition: a `no_std`, allocation-free,
-dependency-free Rust core that validates, formats and updates edk2 NV variable images byte for byte,
-plus a CLI that inspects and edits them. The canonical use is an OVMF-style variable store on its own
-partition, written and read by firmware, a bootloader or an operating system that owns the bytes.
+The official Secure Boot policy is **None**: no root keys, SecureBoot=0, tier 0.
+Authenticated writes are refused, not silently accepted by a crypto stub.
+See [the byte-exact EFVS specification](docs/efvs-v1.md), including its
+[checkpoint provenance correction](docs/efvs-v1.md#spec-correction-checkpoint-provenance).
+
+| Primitive | Status |
+| --- | --- |
+| SHA-256, CRC32, checkpoint/record codecs, replay, compaction | Implemented, dependency-free |
+| AUTH_2 structure and timestamp rules | Shared pure authentication parser/rules |
+| Signature verification | Authorised unsupported stub; no production verifier |
+| `NoneAnchor` | Implemented, boot-local only, no rollback protection |
+| TPM2 NV / OP-TEE RPMB / Qualcomm devinfo slot 31 | Authorised unsupported platform stubs |
+| Protected checkpoint provenance | Not implemented; all posture reporting capped at 0 |
+
+Nominal tiers are 0 (no protected freshness), 1 (boot-time monotonic freshness),
+2 (runtime freshness). None is advertised above 0 today: an unkeyed checkpoint
+digest cannot bind authenticated state or its counter on attacker-writable media.
+Tier 0 under Policy None does **not** claim authenticated integrity.
 
 ## What this repository owns
+
+- **Live format**: EFVS v1 header/checkpoint/log, SET/APPEND/DELETE replay,
+  torn-tail recovery, explicit boot-time compaction, config table and anchor interfaces.
+- **Interoperability**: the edk2 operations below remain available unchanged.
 
 - **Identity**: the `(name, vendor GUID)` key — UTF-16LE names with their on-disk NUL, 16-byte EFI
   wire-order GUIDs (not UUID text order).
@@ -88,7 +107,7 @@ The `efivar-store` binary (package `efivar-store-cli`) works on a partition, a b
 image file:
 
 ```sh
-cargo run --locked -p efivar-store-cli -- init --image store.img --size 1048576 --layout auth
+cargo run --locked -p efivar-store-cli -- init --efvs --image store.img --size 1048576
 cargo run --locked -p efivar-store-cli -- --image store.img inspect
 echo -n linux > value.bin
 cargo run --locked -p efivar-store-cli -- --image store.img set \
@@ -101,10 +120,17 @@ cargo run --locked -p efivar-store-cli -- --image store.img delete \
     --name LoaderEntryDefault --guid 4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
 ```
 
-`inspect`, `list` and `get` open the store read-only and take no lock. `set`, `delete` and `oneshot`
-take an exclusive `flock`, reload under it, flush every edk2 phase and verify the readback, so
-cooperative writers cannot interleave. `oneshot` writes the standard Boot Loader Interface
-`LoaderEntryOneShot` variable (NV|BS|RT, UTF-16LE with a NUL).
+`--efvs` selects the live container; omit it for an edk2 interoperability FV.
+`compact --image store.img` is an explicit offline firmware-equivalent operation.
+`import-edk2 --from old.fd --image new.img --size 1048576` preserves live edk2
+variables in a fresh EFVS checkpoint (boot policy still drops authenticated keys).
+EFVS set/delete/oneshot append only one record and fsync; they never rewrite the
+whole image or reclaim on exhaustion. The shared serializer supplies these bytes.
+
+`inspect`, `list` and `get` open the store read-only and take no lock. Mutations
+take an exclusive `flock`, reload, flush and verify readback. EFVS flushes the appended
+record; edk2 retains its ordered phase sequence. `oneshot` writes the standard
+Boot Loader Interface `LoaderEntryOneShot` variable (NV|BS|RT, UTF-16LE with a NUL).
 
 The crate also ships a host example with the same operations in wire-order GUID hex:
 

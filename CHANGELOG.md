@@ -17,6 +17,14 @@
   — with lab record ids, source citations and `[INFERENCE]` marks. `docs/format.md` gains §9 (the
   authenticated-variable API) and the primary references for it; `docs/consumer-guide.md` and `README.md`
   link both and state that no verification is claimed while the crypto primitive is a stub.
+- Add EFVS v1 as the live container, leaving edk2 APIs unchanged for interoperability.
+  Shared no_std, allocation-free codecs, SHA-256, ordered replay, torn-tail recovery,
+  explicit compaction, edk2 migration, configuration table and anchor interfaces.
+- Add EFVS CLI init/inspect/list/get/set/delete/oneshot, offline compact and import-edk2.
+- Official Policy None rejects authenticated updates; anchor/crypto primitives remain
+  explicit unsupported stubs except the real no-persistence NoneAnchor.
+- Freeze GUIDs and byte layouts in docs/efvs-v1.md. Document the source design's
+  checkpoint-provenance gap; cap all advertised posture at tier 0 until resolved.
 
 ## 0.1.0 — 2026-10-07
 

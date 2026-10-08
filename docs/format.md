@@ -1,4 +1,10 @@
-# Byte formats
+# edk2 interoperability byte formats
+
+EFVS v1 is the live container; its checkpoint/log layouts are frozen in
+[efvs-v1.md](efvs-v1.md). This document describes the unchanged **edk2** engine
+used for import/export, inspection and migration of existing stores. `Store::parse`
+and `StoreMut` still mean edk2 FV, never EFVS. Use `efvs::Header` and `replay`
+for EFVS, and `migrate::import_edk2` for conversion to a fresh checkpoint.
 
 **Status (2026-10-07)** — the layouts `crates/efivar-store` parses and writes today, with the offsets
 its implementation uses. Everything here is byte-exact against `src/format.rs` and `src/lib.rs`;

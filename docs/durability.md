@@ -1,8 +1,37 @@
 # Durability
 
-**Status (2026-10-07)** — exactly what `efivar_store::persist::apply` and the Unix adapter
-(`efivar_store::persist::unix`) guarantee today, and the limits that come with them. Nothing here is
-a claim of unconditional power-loss safety.
+EFVS and edk2 have different persistence contracts. Nothing here claims unconditional
+power-loss safety or authentication from an unkeyed digest.
+
+## EFVS: append durability
+
+EFVS updates are complete, 8-byte-aligned hash-chained records, not whole-image
+rewrites. `efvs::append` validates and returns the exact absolute byte range to
+persist. Write that range, flush it, then publish the tentative working set.
+The CLI locks and reloads first, writes only that range, fsyncs and checks readback.
+On I/O failure reload: the tentative in-memory state is not a durable commitment.
+
+Replay stops at the first truncated, malformed, wrongly sequenced or hash-broken
+record. A torn final record loses at most that append; all valid earlier records
+remain usable. Replay never hunts for a later magic. A torn tail requires explicit
+boot/offline compaction before appending; full capacity returns `Full`, never reclaim.
+These guarantees assume writes do not damage earlier already-durable bytes.
+The hash chain detects damage/order, not hostile rewriting or boundary truncation.
+
+Compaction is different: write/flush the new checkpoint, zero/flush the log,
+then bump (if greater) and lock the anchor. An interruption while rewriting the
+single checkpoint may invalidate it; a platform wanting compaction atomicity needs
+a durable spare or journal. `compact` computes bytes but performs no I/O.
+The host compact command is offline image-only. SHA-256 of the checkpoint and
+its serialized counter do not establish provenance; see the
+[spec correction](efvs-v1.md#spec-correction-checkpoint-provenance).
+
+## edk2: ordered phase durability
+
+The remaining sections describe exactly what `efivar_store::persist::apply` and
+`persist::unix` guarantee for edk2 images. Their whole-write/phase limitations and
+non-atomic reclaim remain unchanged; the EFVS torn-record recovery does not apply
+to an edk2 image.
 
 ## 1. The commit contract
 
