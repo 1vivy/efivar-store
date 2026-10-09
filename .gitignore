@@ -1,2 +1,5 @@
 /target/
 /.worktrees/
+/linux/__pycache__/
+/linux/*.build.log
+/linux/efvs-x86_64.json

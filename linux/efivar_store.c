@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Kernel ABI only; the allocation-free Rust engine owns EFVS validation.
- * Any module may export efivar_store_io_enter/leave to supply credentials
- * for backing-device I/O. The optional provider is pinned with symbol_get.
+ * Backing I/O uses the credentials attached to the file by its opener.
  */
 #include <linux/blkdev.h>
 #include <linux/cred.h>
@@ -13,6 +12,10 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/slab.h>
+#include <linux/kobject.h>
+#include <linux/kernfs.h>
+#include <linux/limits.h>
+#include <linux/sysfs.h>
 #include <linux/unaligned.h>
 #include <linux/vmalloc.h>
 
@@ -35,49 +38,166 @@ void __noreturn efvs_panic(void)
 }
 
 static char *dev, *partuuid;
+static char selected_uuid[37];
 module_param(dev, charp, 0);
 MODULE_PARM_DESC(dev, "Backing block device as major:minor");
 module_param(partuuid, charp, 0);
 MODULE_PARM_DESC(partuuid, "Backing partition unique GUID");
 static DEFINE_MUTEX(store_lock);
 static struct file *store_file;
-extern const struct cred *efivar_store_io_enter(void);
-extern void efivar_store_io_leave(const struct cred *old);
-static const struct cred *(*io_enter)(void);
-static void (*io_leave)(const struct cred *old);
 static void *context;
 static u8 *image, *scratch;
 static size_t image_len, scratch_len;
 static bool ready;
+module_param(ready, bool, 0444);
+MODULE_PARM_DESC(ready, "validated backing and registered EFI callbacks (read-only)");
+MODULE_INFO(kernelsu_esp_name, "efivar_store");
+MODULE_INFO(kernelsu_esp_version, "1");
+MODULE_INFO(kernelsu_esp_abi, "1");
+MODULE_INFO(kernelsu_esp_critical, "1");
+static struct kobject *store_efi_kobj;
+static bool own_mountpoint;
+
+static void release_sysfs(void)
+{
+	if (own_mountpoint)
+		sysfs_remove_mount_point(store_efi_kobj, "efivars");
+	own_mountpoint = false;
+	/* A native EFI object was only referenced, never removed. */
+	kobject_put(store_efi_kobj);
+	store_efi_kobj = NULL;
+}
+
+static int acquire_sysfs(void)
+{
+	struct kernfs_node *node;
+	int rc;
+
+	/* Native EFI sysfs is boot-lifetime; reference it through exported APIs. */
+	node = sysfs_get_dirent(firmware_kobj->sd, "efi");
+	if (node) {
+		if (kernfs_type(node) != KERNFS_DIR || !node->priv) {
+			sysfs_put(node);
+			return -EINVAL;
+		}
+		store_efi_kobj = kobject_get_unless_zero(node->priv);
+		sysfs_put(node);
+	} else {
+		store_efi_kobj = kobject_create_and_add("efi", firmware_kobj);
+	}
+	if (!store_efi_kobj)
+		return -ENOMEM;
+	rc = sysfs_create_mount_point(store_efi_kobj, "efivars");
+	if (!rc)
+		own_mountpoint = true;
+	else if (rc != -EEXIST) {
+		release_sysfs();
+		return rc;
+	}
+	return 0;
+}
 static struct efivars vars;
 
-static void release_io_provider(void)
+struct block_scan {
+	struct dir_context context;
+	char name[NAME_MAX + 1];
+	bool selected;
+};
+
+static bool next_block(struct dir_context *context, const char *name, int length,
+		       loff_t offset, u64 inode, unsigned int type)
 {
-	if (io_enter)
-		symbol_put_addr(io_enter);
-	if (io_leave)
-		symbol_put_addr(io_leave);
-	io_enter = NULL;
-	io_leave = NULL;
+	struct block_scan *scan = container_of(context, struct block_scan, context);
+
+	if (scan->selected)
+		return false;
+	if ((length == 1 && name[0] == '.') ||
+	    (length == 2 && name[0] == '.' && name[1] == '.'))
+		return true;
+	if (length > NAME_MAX)
+		return false;
+	memcpy(scan->name, name, length);
+	scan->name[length] = 0;
+	scan->selected = true;
+	return true;
 }
-static void acquire_io_provider(void)
+
+static void put_lookup_file(struct file *file)
 {
-	io_enter = symbol_get(efivar_store_io_enter);
-	io_leave = symbol_get(efivar_store_io_leave);
-	if (!io_enter || !io_leave) {
-		release_io_provider();
-		pr_info("efivar_store: no io credential provider; using caller credentials\n");
+	const struct cred *old = override_creds(file->f_cred);
+
+	fput(file);
+	revert_creds(old);
+}
+
+static int partition_event(const char *name, const char *uuid, char *buffer, dev_t *result)
+{
+	char path[sizeof("/sys/class/block//uevent") + NAME_MAX];
+	char *field, *cursor;
+	struct file *file;
+	const struct cred *old;
+	loff_t pos = 0;
+	ssize_t length;
+	unsigned int major = 0, minor = 0;
+	bool matched = false, have_uuid = false, have_major = false, have_minor = false;
+	int rc = -ENODEV;
+
+	snprintf(path, sizeof(path), "/sys/class/block/%s/uevent", name);
+	file = filp_open(path, O_RDONLY, 0);
+	if (IS_ERR(file))
+		return PTR_ERR(file) == -ENOENT ? -ENODEV : PTR_ERR(file);
+	old = override_creds(file->f_cred);
+	length = kernel_read(file, buffer, PAGE_SIZE - 1, &pos);
+	revert_creds(old);
+	put_lookup_file(file);
+	if (length < 0)
+		return length;
+	if (length == PAGE_SIZE - 1)
+		return -EOVERFLOW;
+	buffer[length] = 0;
+	cursor = buffer;
+	while ((field = strsep(&cursor, "\n"))) {
+		if (!strncmp(field, "PARTUUID=", 9)) {
+			if (have_uuid)
+				return -EINVAL;
+			have_uuid = true;
+			matched = strlen(field + 9) == 36 &&
+				  !strncasecmp(field + 9, uuid, 36);
+		} else if (!strncmp(field, "MAJOR=", 6)) {
+			if (have_major || !field[6] ||
+			    strspn(field + 6, "0123456789") != strlen(field + 6) ||
+			    kstrtouint(field + 6, 10, &major))
+				return -EINVAL;
+			have_major = true;
+		} else if (!strncmp(field, "MINOR=", 6)) {
+			if (have_minor || !field[6] ||
+			    strspn(field + 6, "0123456789") != strlen(field + 6) ||
+			    kstrtouint(field + 6, 10, &minor))
+				return -EINVAL;
+			have_minor = true;
+		}
 	}
+	if (matched) {
+		if (!have_major || !have_minor || !major || major > 0xfff || minor > 0xfffff)
+			rc = -EINVAL;
+		else {
+			*result = MKDEV(major, minor);
+			rc = 0;
+		}
+	}
+	return rc;
 }
-static int match_partition(struct device *device, const void *value)
-{
-	struct block_device *bdev = dev_to_bdev(device);
-	return bdev->bd_meta_info && !strncasecmp(bdev->bd_meta_info->uuid, value, 36);
-}
+
 static int uuid_device(const char *uuid, dev_t *result)
 {
-	struct device *device;
-	int i;
+	struct block_scan scan = { .context.actor = next_block };
+	struct file *directory;
+	const struct cred *old;
+	char *buffer;
+	dev_t candidate = 0, selected = 0;
+	bool found = false;
+	int i, rc;
+
 	if (strlen(uuid) != 36)
 		return -EINVAL;
 	for (i = 0; i < 36; i++) {
@@ -87,12 +207,45 @@ static int uuid_device(const char *uuid, dev_t *result)
 		} else if (!isxdigit(uuid[i]))
 			return -EINVAL;
 	}
-	device = class_find_device(&block_class, NULL, uuid, match_partition);
-	if (!device)
-		return -ENODEV;
-	*result = dev_to_bdev(device)->bd_dev;
-	put_device(device);
-	return 0;
+	directory = filp_open("/sys/class/block", O_RDONLY | O_DIRECTORY, 0);
+	if (IS_ERR(directory))
+		return PTR_ERR(directory);
+	buffer = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!buffer) {
+		put_lookup_file(directory);
+		return -ENOMEM;
+	}
+	for (;;) {
+		scan.selected = false;
+		old = override_creds(directory->f_cred);
+		rc = iterate_dir(directory, &scan.context);
+		revert_creds(old);
+		if (rc)
+			break;
+		if (!scan.selected) {
+			rc = found ? 0 : -ENODEV;
+			if (found) {
+				*result = selected;
+				memcpy(selected_uuid, uuid, sizeof(selected_uuid));
+			}
+			break;
+		}
+		/* Never open/read another sysfs node inside its readdir lock. */
+		rc = partition_event(scan.name, uuid, buffer, &candidate);
+		if (!rc) {
+			if (found) {
+				rc = -EEXIST;
+				break;
+			}
+			selected = candidate;
+			found = true;
+		} else if (rc != -ENODEV) {
+			break;
+		}
+	}
+	kfree(buffer);
+	put_lookup_file(directory);
+	return rc;
 }
 static int discover_device(dev_t *result)
 {
@@ -134,11 +287,14 @@ static int discover_device(dev_t *result)
 	of_node_put(chosen);
 	return rc;
 }
-/* Caller brackets the entire I/O section; never nest credential overrides here. */
+/* Override only actual backing-file I/O, never the EFI caller's other work. */
 static int read_bytes(size_t offset, void *buffer, size_t len)
 {
 	loff_t pos = offset;
+	const struct cred *old = override_creds(store_file->f_cred);
 	ssize_t n = kernel_read(store_file, buffer, len, &pos);
+
+	revert_creds(old);
 
 	if (n == len)
 		return 0;
@@ -149,8 +305,11 @@ static int read_bytes(size_t offset, void *buffer, size_t len)
 static int write_bytes(size_t start, size_t end)
 {
 	loff_t pos = start;
+	const struct cred *old = override_creds(store_file->f_cred);
 	ssize_t n = kernel_write(store_file, image + start, end - start, &pos);
 	int rc;
+
+	revert_creds(old);
 
 	if (n != end - start) {
 		pr_err_ratelimited(
@@ -158,7 +317,9 @@ static int write_bytes(size_t start, size_t end)
 		    end - start, n);
 		return n < 0 ? n : -EIO;
 	}
+	old = override_creds(store_file->f_cred);
 	rc = vfs_fsync(store_file, 0);
+	revert_creds(old);
 	if (rc)
 		pr_err_ratelimited("efivar_store: vfs_fsync failed: %d\n", rc);
 	return rc;
@@ -226,13 +387,13 @@ static void release_store(void)
 	kvfree(scratch);
 	kvfree(image);
 	if (store_file) {
-		const struct cred *old = io_enter ? io_enter() : NULL;
+		const struct cred *old = override_creds(store_file->f_cred);
 
 		fput(store_file);
-		if (io_leave)
-			io_leave(old);
+		store_file = NULL;
+		revert_creds(old);
 	}
-	release_io_provider();
+	release_sysfs();
 }
 static int name_length(const u16 *name, size_t bound)
 {
@@ -309,7 +470,6 @@ static efi_status_t set_variable(efi_char16_t *name, efi_guid_t *guid, u32 attr,
 	u8 verify[512];
 	size_t start, end, pos, chunk;
 	efi_status_t status;
-	const struct cred *old;
 	int units = name_length(name, MAX_NAME);
 	if (!guid || (size && !data) || size > MAX_IMAGE || units <= 0)
 		return EFI_INVALID_PARAMETER;
@@ -319,7 +479,6 @@ static efi_status_t set_variable(efi_char16_t *name, efi_guid_t *guid, u32 attr,
 		       : EFI_DEVICE_ERROR;
 	if (status)
 		goto out;
-	old = io_enter ? io_enter() : NULL;
 	if (write_bytes(start, end))
 		goto io_error;
 	/* Verify exactly the appended range, without another large allocation. */
@@ -335,13 +494,10 @@ static efi_status_t set_variable(efi_char16_t *name, efi_guid_t *guid, u32 attr,
 			goto io_error;
 		}
 	}
-	goto io_done;
+	goto out;
 io_error:
 	reload(); /* A failed reload leaves callbacks disabled. */
 	status = EFI_DEVICE_ERROR;
-io_done:
-	if (io_leave)
-		io_leave(old);
 out:
 	mutex_unlock(&store_lock);
 	return status;
@@ -367,11 +523,12 @@ static const struct efivar_operations ops = {
 static int __init efivar_store_init(void)
 {
 	dev_t device;
-	const struct cred *old;
+	struct block_device *backing;
 	int rc = discover_device(&device);
+	/* Output-only even if the loader supplies ready=1. */
+	ready = false;
 	if (rc)
 		return rc;
-	acquire_io_provider();
 	store_file = bdev_file_open_by_dev(device, BLK_OPEN_READ | BLK_OPEN_WRITE, NULL, NULL);
 	if (IS_ERR(store_file)) {
 		rc = PTR_ERR(store_file);
@@ -380,13 +537,23 @@ static int __init efivar_store_init(void)
 		release_store();
 		return rc;
 	}
-	old = io_enter ? io_enter() : NULL;
+	/* A hotplug/reused dev_t must not turn UUID selection into another store. */
+	backing = file_bdev(store_file);
+	if (selected_uuid[0] &&
+	    (!backing->bd_meta_info ||
+	     strncasecmp(backing->bd_meta_info->uuid, selected_uuid, 36))) {
+		release_store();
+		return -ENODEV;
+	}
 	rc = load();
-	if (io_leave)
-		io_leave(old);
 	if (rc) {
 		pr_err("efivar_store: no usable EFVS store; firmware must initialize blank "
 		       "partitions (no bytes written)\n");
+		release_store();
+		return rc;
+	}
+	rc = acquire_sysfs();
+	if (rc) {
 		release_store();
 		return rc;
 	}
@@ -412,5 +579,6 @@ static void __exit efivar_store_exit(void)
 module_init(efivar_store_init);
 module_exit(efivar_store_exit);
 MODULE_LICENSE("GPL");
+MODULE_INFO(import_ns, "VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
 MODULE_AUTHOR("efivar-store contributors");
 MODULE_DESCRIPTION("Block-backed EFI variable service using the efivar-store Rust engine");

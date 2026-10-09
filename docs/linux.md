@@ -50,41 +50,26 @@ opened with the kernel SID. SELinux denied `fd:use` during device I/O. The write
 failed, then reload failed for the same reason and correctly disabled callbacks,
 making later efivarfs reads return EIO. The physical log remained untouched.
 
-The backend optionally acquires a credential-provider pair with `symbol_get()`
-at module init. **Any module** may export these GPL symbols:
+The backend brackets each `kernel_read`, `kernel_write`, `vfs_fsync` and final
+`fput` with `override_creds(store_file->f_cred)` / `revert_creds`. The file's
+opener credentials are retained by the file and the override API; no private
+credential symbols, provider ABI, `symbol_get` or product/root-runtime dependency
+is involved. Pure in-memory get/next/query/replay need no credential override.
+Initial backing-file open uses the module loader's credentials. Load during
+rdinit before policy, then permit that opener domain access to the backing block
+device through module-owned policy. UID 0 is not a SELinux authorization.
 
-```c
-const struct cred *efivar_store_io_enter(void);
-void efivar_store_io_leave(const struct cred *old);
-```
+Kernel read/write short counts, fsync errors, verification mismatches and reload
+failures retain their logged operation/result and disable callbacks on failed
+reload. There is no fallback to caller credentials.
 
-`enter` temporarily installs the provider's authorized device-I/O credentials
-and returns the caller's original credentials; `leave` restores that exact
-token on the same task. The provider owns the credentials and their security
-domain transition. The backend knows neither SELinux blob layouts nor policy
-contexts, and does not create, modify or permanently install credentials.
-
-Both exports must resolve at init. Each successful lookup pins its provider.
-If either is absent, the backend releases any partial reference and logs
-`no io credential provider; using caller credentials`. There is no later
-provider lookup: load the provider before this backend. Complete references
-remain pinned until callback exclusion/cleanup at unload or init failure, then
-are released with `symbol_put_addr()`. The export names are lookup strings, not
-undefined ELF imports, so a relocating loader need not resolve module symbols.
-
-One enter/leave pair brackets the complete probe/load section and each
-set/write/fsync/readback section, including error-path reload. Callback sections
-run under `store_lock`, without nested overrides. Every error path restores
-credentials before unlocking; file release is separately bracketed during
-cleanup before dropping the provider references. Pure in-memory get/next/query
-need no override. Initial backing-file open uses the module loader's credentials.
-Without a provider, ordinary caller-credential I/O remains available.
-
-Kernelesp supplies this optional contract using its own credential, whose domain
-it transitions to esu when second-stage policy is ready. This is an integration
-choice, not a dependency of the generic backend. Kernel read/write short counts,
-fsync errors, verification mismatches and reload failures are logged with their
-failing step and result. A failed reload still leaves callbacks disabled.
+The backend discovers the native boot-lifetime EFI object through exported
+sysfs/kobject APIs, or creates its own `efi` object under `firmware_kobj`. It creates `efivars` only when absent,
+records mountpoint ownership, and removes only the mountpoint it created. A
+native EFI tree is never removed. Mount filesystem type `efivarfs` at
+`/sys/firmware/efi/efivars`; directory presence alone is not readiness. The
+read-only `ready` parameter becomes true only after validated store load and
+successful callback registration. Unmount efivarfs before unload.
 
 The QEMU gate has **no SELinux policy** and cannot prove that an enforcing
 Android HAL no longer triggers `fd:use` denial. An enforcing real-phone boot
@@ -94,11 +79,18 @@ The VM still checks registration, durability and failure/refusal behavior.
 ## Discovery and registration
 
 Accept mutually exclusive `dev=major:minor` or `partuuid=<unique-GPT-UUID>`.
-Without parameters, read `/chosen/efivar-store,partuuid` from DT. UUID lookup
-iterates live `block_class` partitions and matches `bd_meta_info.uuid`
-case-insensitively, after checking canonical 36-character UUID syntax. It never
-calls discarded boot-only lookup functions. Open with
-`bdev_file_open_by_dev(dev, BLK_OPEN_READ | BLK_OPEN_WRITE, NULL, NULL)`.
+Without parameters, read `/chosen/efivar-store,partuuid` from DT. Mount sysfs at
+`/sys` before loading the module when using either UUID discovery path. Lookup
+reads canonical `/sys/class/block/<name>/uevent` entries, matching the exact
+36-character PARTUUID case-insensitively and validating decimal MAJOR/MINOR.
+It requires one match: missing UUID is `ENODEV`, ambiguity is `EEXIST`, malformed
+fields are `EINVAL`; I/O errors propagate. No udev by-partuuid link, `block_class`
+private import, boot-only lookup, or root helper is required. Each uevent is read
+after readdir releases its locks, using its opener credentials. Open with
+`bdev_file_open_by_dev(dev, BLK_OPEN_READ | BLK_OPEN_WRITE, NULL, NULL)` and
+recheck the opened partition's UUID before loading bytes, rejecting hotplug
+device-number reuse. Explicit `dev=major:minor` remains independent of sysfs
+UUID enumeration.
 
 Registration follows `tee_stmm_efi`: unregister generic runtime operations,
 register ours, restore generic operations on registration failure or removal.
@@ -118,19 +110,68 @@ Module.symvers, and System.map. `modules_prepare` alone is insufficient.
 
 ```sh
 make -C linux KMI_SRC=/path/to/phone-common KMI_OUT=/path/to/gki-out \
-  LLVM=/usr/bin/
+  ARCH=arm64 LLVM=/usr/bin/
 ```
 
 The Makefile works both through its outer target and direct ACK kbuild (including
-kernelesp's pinned-source builder). It builds the staticlib offline with pinned
+kernelsu-esp's pinned-source builder). It builds the staticlib offline with pinned
 `nightly-2026-08-08`, `-Z build-std=core,compiler_builtins`, and installed `rust-src`;
-no downloaded softfloat target is needed. Override `CARGO` and `RUST_TOOLCHAIN`
-only with an equivalently supported toolchain. The target is
-`aarch64-unknown-none-softfloat`, forbidding FP/NEON. Rust code generation uses
-static relocations, one codegen unit, no embedded LLVM bitcode, and no forced
+no downloaded softfloat target is needed. Override `CARGO`, `EFVS_RUSTC` and
+`RUST_TOOLCHAIN` only with an equivalently supported toolchain. Cargo explicitly
+uses `EFVS_RUSTC` rather than an unrelated kernel-exported `RUSTC` found on PATH.
+`ARCH=arm64` selects `aarch64-unknown-none-softfloat`, forbidding FP/NEON.
+`ARCH=x86` or `ARCH=x86_64` derives `efvs-x86_64.json` from the pinned compiler's
+`x86_64-unknown-none` softfloat target and actual kernel
+`include/config/auto.conf`, not from the host.
+`make -C linux KDIR=/lib/modules/$(uname -r)/build` supports standalone/DKMS
+packaging with a configured kernel output. Unless explicitly overridden, `LLVM`
+follows that kernel's `CONFIG_CC_IS_CLANG`: Clang for a Clang kernel, GCC
+otherwise. Ordinary modpost errors remain fatal; DKMS installs no relocating
+loader.
+Rust code generation uses static relocations, one codegen unit, no embedded LLVM bitcode, and no forced
 unwind tables. Kbuild links the C object and a garbage-collected `ld -r
 --whole-archive` Rust object into one `efivar_store.ko`, retaining only the FFI
 roots and their dependencies.
+The freestanding invocation explicitly disables shared generic instantiations
+(`-Zshare-generics=n`) and LTO, and rebuilds core/compiler-builtins with one
+codegen unit and v0 symbol mangling. Cargo's workspace `profile.release.lto=true`
+is overridden only for this kernel build; host and firmware profiles remain
+unchanged. Custom target builds retain Cargo's required `-Zjson-target-spec`.
+
+`linux/rustc-wrapper.py` selects `linux/compiler-builtins.rs` as the designated
+compiler-runtime crate. It changes only that crate's source operand: every
+sanitizer, metadata, target and codegen argument remains identical to the other
+freestanding crates. The descriptor defines no functions. LLVM-lowered helper
+calls therefore resolve to genuine kernel implementations, never panicking or
+no-op substitutes. Kbuild garbage-collects unused core code before ordinary
+module import/CRC admission; any required helper absent from the target kernel
+fails admission. Nothing ignores unresolved symbols or exempts runtime imports
+from that check. The previous accepted ARM ELF required only memory runtime
+helpers (`bcmp`, `memcmp`, `memcpy`, `memmove`, `memset`); the configured x86
+kernel exports all five with genuine version CRCs. Newly produced ELF imports
+and objtool diagnostics, not this historic inventory, determine acceptance.
+The kernel likewise supplies its own designated compiler runtime, but this
+descriptor intentionally does not copy the kernel's panicking arithmetic stubs.
+
+The generated x86 target follows the kernel's `scripts/generate_rust_target.rs`:
+external retpoline thunks plus indirect-call/branch retpolines when configured,
+SLS indirect-jump/return hardening when configured, kernel code model, no red
+zone and no user-space stack probes. Kbuild separately follows `arch/x86/Makefile`
+for external return thunks, IBT landing pads with jump tables disabled, and
+configured call padding. Enabled frame-pointer and CFI/normalized-integer settings
+are honored even without CONFIG_RUST; the freestanding engine must obey the
+kernel's codegen/security ABI. The pinned Rust 1.99 nightly supports these
+unstable codegen switches. Changing target configuration or flags rebuilds all
+engine/core/compiler-builtins objects; no mitigation is disabled globally.
+
+An objtool mitigation/IBT warning is a failed build/admission, even if make returns
+zero. The product KMI builder preserves the full `.build.log`, rejects objtool
+diagnostics, and does not emit an admitted receipt. The Android generalized gate
+may explicitly permit modpost warnings only before validating every real
+System.map/CRC import. Ordinary standalone/DKMS builds leave undefined-symbol
+errors fatal. Native EFI and UUID discovery use exported APIs rather than
+`efi_kobj`/`block_class` globals. The exercised targets are recorded below; other
+kernel configurations still require their own build and load proof.
 
 **Panic strategy:** the freestanding build deliberately uses
 `-Z unstable-options -C panic=immediate-abort`. Ordinary `panic=abort` still
@@ -144,11 +185,12 @@ into a panic and readable KCONSOLE dump. Host tests use the normal host panic
 strategy. No reachable Debug derivations or formatting operations are introduced
 by the FFI. The final tested module contains **zero core::fmt symbols**.
 
-C compilation and native object linking used **LLVM 23.1.1 at `/usr/bin/`**.
-ACK was built with Android clang 19.0.1, so its compiler-difference warning is
-expected. Do not use Android LLVM 19 to consume the Rust object's bitcode:
-previous mixed-minor LLVM linking produced invalid IR despite a successful link.
-This build supplies native Rust object code, not kernel Rust metadata/IR.
+ACK C compilation and native-object linking use Android LLVM 19.0.1; the tested
+native kernels use their configured Clang 23.1.1 or GCC 16.2.1 family. The ACK ARM
+output and supplied compiler have different Android build IDs of the same
+r536225 revision; that warning remains visible. Rust supplies native object code,
+not LLVM bitcode or kernel Rust metadata: do not pass mixed-version bitcode
+between Rust and the kernel linker.
 
 Generic kernels with suitable exports can use insmod/modprobe. Trimmed Android
 GKI protects or omits some C exports, so kernelesp's production relocating loader
@@ -156,82 +198,64 @@ resolves undefined symbols against kallsyms before invoking init_module. It does
 not itself apply AArch64 relocations: ACK's `arch/arm64/kernel/module.c` does.
 Successful CRC/System.map admission alone is not a runtime proof.
 
-The phone has efivarfs disabled in its kernel. Kernelesp ships matching upstream
+The phone has efivarfs disabled in its kernel. The independent LKM product ships
 `fs/efivarfs` as `efivarfs.ko`, with its named patch adding project GUID
 `7a5e4b1c-0d3f-4e62-9b8a-1c2d3e4f5a6b` to the removable allowlist. Load the backend
 before mounting it; unknown GUIDs otherwise need CAP_LINUX_IMMUTABLE for deletion.
 
-## Compatibility evidence (2026-10-08)
+## Exercised build targets (2026-10-09)
 
-The old Rust-for-Linux implementation failed the real phone relocating loader
-because its core/kernel crate hashes differed from the phone's exports and
-`core::fmt::Formatter::pad` was absent altogether. The C-glue cutover fixes the
-ABI cause, rather than renaming imports to guessed crate hashes.
+The final C-glue backend was built and admitted against ACK
+`android16-6.12`, generation 6, on both architectures:
 
-Saved evidence, relative to `/home/vivy/Projects/efisp-projects`:
+| Architecture | CRC-versioned imports | Admitted private imports |
+| --- | ---: | ---: |
+| aarch64 | 46 | 8 |
+| x86_64 | 57 | 0 |
 
-- Failure: `gobbl-lab/records/20261008T055846Z-phone-efvs-lkm-test/efvs.json`.
-- Phone symbols: `gobbl-lab/records/20261008T055912Z-phone-efvs-kallsyms/evidence/01-kallsyms.stdout`.
-- ACK source: `.work/thinpool-proof/.work/phone-common`, android16-6.12,
-  `925a103d123c30a84577f29e1573376aacbde94b`, KMI generation 6.
-- Kernel output: `.work/thinpool-proof/.work/gki-out`.
+ARM private imports are `efivars_generic_ops_register`,
+`efivars_generic_ops_unregister`, `efivars_register`, `efivars_unregister`,
+`filp_open`, `kobject_get_unless_zero`, `sysfs_create_mount_point` and
+`sysfs_remove_mount_point`. The actual target's System.map/CRC checks admit them;
+this list is not an exception to artifact admission.
 
-`readelf -Ws` and `llvm-nm --undefined-only` show no undefined `_RN` symbol.
-Every undefined symbol exists in the saved phone kallsyms: **missing set empty**.
-The Rust object has no unwind section and disassembly of the final module shows
-no FP/NEON instructions. KMI admission reports **26 versioned entries** (including
-module_layout) and **six kallsyms-resolved imports**, with no CRC mismatch:
-
-```text
-__symbol_get
-block_class
-efivars_generic_ops_register
-efivars_generic_ops_unregister
-efivars_register
-efivars_unregister
-```
-
-The receipt was generated using the unmodified kernelesp verifier's
-`verify_module`, `kmi_identity`, and `provenance` functions, then admitted by:
-
-```sh
-python3 /path/to/kernelesp/scripts/kmi_modules.py verify \
-  --kmi-out /path/to/gki-out --module linux/efivar_store.ko
-```
-
-The existing kernelesp tracked SOURCE_REVISION pins the earlier implementation,
-and EFIVAR_STORE_REPO only changes the clone origin, not that revision. The
-packaged make flow therefore cannot select this branch without a pin update;
-no kernelesp tracked files were changed here.
+Standalone builds against `7.2.8-2-cachyos` (Clang) and
+`6.18.52-1-cachyos-lts` (GCC) passed with `ARCH=x86`, native compiler selection,
+fatal modpost and no objtool diagnostics. These are build results, not claims of
+loading either module into the workstation kernel.
 
 ## Exercised round-trip
 
 ```sh
-cargo test --locked --offline
-cargo clippy --all-targets --locked --offline -- -D warnings
+cargo test --workspace --locked --offline
+cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+python3 -m unittest discover -s linux -p 'test_rust*.py'
 python3 linux/test_qemu.py --kernel-out /path/to/gki-out \
-  --backend linux/efivar_store.ko --frontend /path/to/efivarfs.ko \
+  --backend /path/to/arm64/efivar_store.ko --frontend /path/to/efivarfs.ko \
   --busybox /path/to/static-arm64-busybox --cli target/debug/efivar-store \
-  --loader /path/to/relocating-insmod --work /var/tmp/efvs-io-provider-accepted
+  --loader /path/to/ksuinit --loader-arg=--load-module \
+  --partuuid f5a3bc0f-4dea-56c6-aeed-cb638157a125 \
+  --work /var/tmp/efvs-uuid-proof
 ```
 
-All **76 existing tests plus three new FFI ABI tests** pass. FFI tests exercise
-changed-range preservation, create/update/append/delete/replay/iteration, policy
-precedence, query sizing, exhaustion without writes, torn-tail recovery and
-blank refusal. Clippy with warnings denied passes.
+The explicit UUID above names a **new disposable GPT fixture**, not a physical
+device or product default. `--partuuid` requires `sfdisk`, wraps the initialized
+EFVS image in a real GPT partition, and boots it through the kernel partition
+parser. Omit it to exercise the explicit `dev=major:minor` path.
 
-`linux/test_qemu.py` uses the production `esuinit::load_module` executable, not a
-test relocation engine. Final observed output:
+The shipped loader and final ARM backend passed seven VM phases: missing UUID,
+duplicate UUID, write/update/delete, reboot/read, firmware compaction, torn-tail
+reread, and blank refusal. Missing and duplicate selectors returned ENODEV and
+EEXIST respectively. Host comparisons confirmed no writes to rejected disks and
+no writes outside the selected GPT partition. Logs:
+`/var/tmp/efvs-final-uuid-proof-20261009/{missing,duplicate,write,read,compact,torn,blank}.log`.
 
-```text
-PASS: immediate read, update, delete, reboot, firmware compaction, torn-tail reread and blank refusal without writes
-```
+The host suite covers FFI changed-range preservation, create/update/append/
+delete/replay/iteration, policy precedence, query sizing, exhaustion without
+writes, torn-tail recovery and blank refusal.
 
-Logs are `/var/tmp/efvs-io-provider-accepted/{write,read,compact,torn,blank}.log`.
-The blank image is host-confirmed byte-identical to its initial 1 MiB of zeroes.
-The provider is absent in this VM. Every boot reports
-`no io credential provider; using caller credentials`; the gate exercises the
-optional-provider fallback, not provider credential switching or enforcing
-SELinux access.
-UUID/DT discovery, EFI-present generic-backend replacement and physical-device
-power cuts were not exercised. **No device commands were issued.**
+The VM has no SELinux policy. It does not prove enforcing HAL-domain access,
+DT selection, native EFI backend replacement, or physical-device power-cut
+behavior. Enforcing Android credential and boot-control acceptance remain
+separate gates. No physical-device commands were issued for these checks.
+

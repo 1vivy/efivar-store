@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: GPL-2.0-only
+CARGO ?= $(HOME)/.cargo/bin/cargo
+RUST_TOOLCHAIN ?= nightly-2026-08-08
+EFVS_RUSTC ?= $(dir $(CARGO))rustc
+ifeq ($(ARCH),arm64)
+RUST_TARGET := aarch64-unknown-none-softfloat
+RUST_TARGET_DIR := $(RUST_TARGET)
+else ifneq ($(filter x86 x86_64,$(ARCH)),)
+RUST_TARGET := $(abspath $(obj)/efvs-x86_64.json)
+RUST_TARGET_DIR := efvs-x86_64
+EFVS_TARGET_DEP := $(obj)/efvs-x86_64.json
+$(obj)/efvs-x86_64.json: $(src)/rust-target.py $(objtree)/include/config/auto.conf FORCE
+	python3 $(src)/rust-target.py --rustc "$(EFVS_RUSTC)" --toolchain "$(RUST_TOOLCHAIN)" --config "$(objtree)/include/config/auto.conf" --output "$@"
+targets += efvs-x86_64.json
+clean-files += efvs-x86_64.json
+else
+$(error efivar_store supports ARCH=arm64 or ARCH=x86_64)
+endif
+RUST_FLAGS := -Z unstable-options -C relocation-model=static -C panic=immediate-abort -C force-unwind-tables=no -C embed-bitcode=no
+# Keep freestanding profile/codegen separate from host and firmware builds.
+# Runtime helpers are supplied by the kernel, not by upstream runtime bodies.
+RUST_FLAGS += -Zshare-generics=n -Ccodegen-units=1 -Clto=n -Csymbol-mangling-version=v0
+# Follow kernel Rust codegen even when CONFIG_RUST is disabled: this engine
+# has its own freestanding core, but must obey the kernel's CFI/mitigation ABI.
+ifeq ($(CONFIG_FRAME_POINTER),y)
+RUST_FLAGS += -Cforce-frame-pointers=y
+endif
+ifneq ($(filter y,$(CONFIG_CFI_CLANG) $(CONFIG_CFI)),)
+RUST_FLAGS += -Zsanitizer=kcfi -Zmerge-functions=disabled
+ifeq ($(CONFIG_CFI_ICALL_NORMALIZE_INTEGERS),y)
+RUST_FLAGS += -Zsanitizer-cfi-normalize-integers
+endif
+endif
+ifneq ($(filter x86 x86_64,$(ARCH)),)
+ifeq ($(CONFIG_MITIGATION_RETHUNK),y)
+RUST_FLAGS += -Zfunction-return=thunk-extern
+endif
+ifeq ($(CONFIG_X86_KERNEL_IBT),y)
+RUST_FLAGS += -Zcf-protection=branch -Cjump-tables=n
+endif
+ifeq ($(CONFIG_CALL_PADDING),y)
+RUST_FLAGS += -Zpatchable-function-entry=$(CONFIG_FUNCTION_PADDING_BYTES),$(CONFIG_FUNCTION_PADDING_BYTES)
+endif
+endif
+obj-m := efivar_store.o
+efivar_store-objs := efivar_store_glue.o efvs_engine.o
+$(obj)/efivar_store_glue.o: $(src)/efivar_store.c FORCE
+	$(call if_changed_dep,cc_o_c)
+# Cargo tracks all engine sources; both ACK/DDK and standalone kbuild enter here.
+$(src)/../target/$(RUST_TARGET_DIR)/release/libefivar_store_ffi.a: $(EFVS_TARGET_DEP) $(src)/rustc-wrapper.py $(src)/compiler-builtins.rs FORCE
+	cd "$(src)/.." && RUSTC="$(EFVS_RUSTC)" RUSTC_WRAPPER="$(abspath $(src)/rustc-wrapper.py)" CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 RUSTFLAGS="$(RUST_FLAGS)" $(CARGO) +$(RUST_TOOLCHAIN) build --locked --offline -Zjson-target-spec -Z build-std=core,compiler_builtins --release --target $(RUST_TARGET) -p efivar-store-ffi --no-default-features
+quiet_cmd_efvs = LD      $@
+      cmd_efvs = $(LD) -r --gc-sections $(addprefix -u ,efvs_ctx_size efvs_scratch_size efvs_load efvs_get efvs_next efvs_set efvs_query) --whole-archive $< --no-whole-archive -o $@
+$(obj)/efvs_engine.o: $(src)/../target/$(RUST_TARGET_DIR)/release/libefivar_store_ffi.a FORCE
+	$(call if_changed,efvs)
+targets += efvs_engine.o efivar_store_glue.o

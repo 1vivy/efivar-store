@@ -7,10 +7,12 @@ production relocating loader; ordinary insmod remains a diagnostic option.
 """
 import argparse
 from pathlib import Path
+import shlex
 import shutil
 import stat
 import subprocess
 import tempfile
+import uuid
 
 GUID = "7a5e4b1c-0d3f-4e62-9b8a-1c2d3e4f5a6b"
 
@@ -30,15 +32,20 @@ def archive(files: dict[str, tuple[bytes, int]]) -> bytes:
     return bytes(result)
 
 
-def init_script(phase: str, transports: list[str], relocating: bool) -> bytes:
+def init_script(phase: str, transports: list[str], relocating: bool, loader_args: list[str], partuuid: uuid.UUID | None) -> bytes:
     loads = "\n".join(f"/bin/busybox insmod /lib/{name} || fail transport-{name}" for name in transports)
     loader = "/bin/relocating-insmod" if relocating else "/bin/busybox insmod"
-    blank = f"""
-{loader} /lib/efivar_store.ko dev="$dev" && fail blank-accepted
-echo EFIVAR_QEMU_PASS-blank
+    if relocating:
+        loader += "".join(" " + shlex.quote(argument) for argument in loader_args)
+    selector = 'dev="$dev"' if partuuid is None else "partuuid=" + str(
+        uuid.uuid5(partuuid, "missing") if phase == "missing" else partuuid)
+    refusal = f"""
+{loader} /lib/efivar_store.ko {selector} && fail {phase}-accepted
+/bin/busybox test ! -d /sys/module/efivar_store || fail rejected-backend-present
+echo EFIVAR_QEMU_PASS-{phase}
 /bin/busybox poweroff -f
 while :; do :; done
-""" if phase == "blank" else ""
+""" if phase in ("blank", "missing", "duplicate") else ""
     actions = r"""
 /bin/busybox printf '\007\000\000\000first' > "$keep" || fail set
 /bin/busybox printf '\007\000\000\000first' > /expected
@@ -65,8 +72,8 @@ dev=$(/bin/busybox cat /sys/class/block/vda/dev)
 major=${{dev%:*}}; minor=${{dev#*:}}
 /bin/busybox mknod /dev/vda b "$major" "$minor" || fail block-node
 {loader} /lib/efivarfs.ko || fail frontend-insertion
-{blank}
-{loader} /lib/efivar_store.ko dev="$dev" || fail backend-insertion
+{refusal}
+{loader} /lib/efivar_store.ko {selector} || fail backend-insertion
 /bin/busybox mount -t efivarfs -o rw efivarfs /efivars || fail mount-rw
 keep=/efivars/Roundtrip-{GUID}
 deleted=/efivars/Deleted-{GUID}
@@ -86,8 +93,14 @@ def main() -> None:
     parser.add_argument("--busybox", type=Path, required=True)
     parser.add_argument("--cli", type=Path, required=True)
     parser.add_argument("--work", type=Path)
-    parser.add_argument("--loader", type=Path, help="Static esuinit relocating-insmod example for trimmed GKI")
+    parser.add_argument("--loader", type=Path, help="Static relocating module loader for trimmed GKI")
+    parser.add_argument("--loader-arg", action="append", default=[], help="Argument preceding the module path; use --loader-arg=--load-module for esuinit")
+    parser.add_argument("--partuuid", type=uuid.UUID, help="Exercise GPT partition selection, including missing and duplicate UUID refusal; requires sfdisk")
     args = parser.parse_args()
+    if args.loader_arg and not args.loader:
+        parser.error("--loader-arg requires --loader")
+    if args.partuuid and not shutil.which("sfdisk"):
+        parser.error("--partuuid requires sfdisk")
     work = args.work or Path(tempfile.mkdtemp(prefix="efivar-qemu-", dir="/var/tmp"))
     if args.work:
         work.mkdir(parents=True, exist_ok=False)
@@ -108,7 +121,8 @@ def main() -> None:
     qemu = shutil.which("qemu-system-aarch64")
     if qemu is None:
         raise SystemExit("qemu-system-aarch64 is missing")
-    for phase in ["write", "read", "compact", "torn", "blank"]:
+    phases = (["missing", "duplicate"] if args.partuuid else []) + ["write", "read", "compact", "torn", "blank"]
+    for phase in phases:
         if phase == "blank":
             image = work / "blank.img"
             image.write_bytes(bytes(1048576))
@@ -126,13 +140,32 @@ def main() -> None:
             # Truncate the last record's bytes, retaining the fixed block-device size.
             raw[log_offset + length - 16:] = bytes(len(raw) - log_offset - length + 16)
             image.write_bytes(raw)
-        files["init"] = (init_script(phase, transports, args.loader is not None), stat.S_IFREG | 0o755)
+        files["init"] = (init_script(phase, transports, args.loader is not None, args.loader_arg, args.partuuid), stat.S_IFREG | 0o755)
         initrd = work / f"{phase}.cpio"
         initrd.write_bytes(archive(files))
+        disk = image
+        offset = 1048576
+        size = image.stat().st_size
+        if args.partuuid:
+            disk = work / f"{phase}-gpt.img"
+            with disk.open("xb") as output:
+                output.truncate(offset + size + 33 * 512)
+            subprocess.run(["sfdisk", "--no-reread", "--no-tell-kernel", str(disk)],
+                           input=f"label: gpt\n\nstart=2048,size={size // 512},type=linux,uuid={args.partuuid}\n",
+                           text=True, check=True, stdout=subprocess.DEVNULL)
+            with disk.open("r+b") as output:
+                output.seek(offset)
+                output.write(image.read_bytes())
+        before = disk.read_bytes()
         command = [qemu, "-machine", "virt", "-cpu", "max", "-m", "1024", "-smp", "2", "-nographic", "-no-reboot",
                    "-kernel", str(args.kernel_out / "arch/arm64/boot/Image"), "-initrd", str(initrd),
                    "-append", "console=ttyAMA0 earlycon=pl011,0x9000000 rdinit=/init panic=-1 nokaslr",
-                   "-drive", f"if=none,file={image},format=raw,id=store", "-device", "virtio-blk-pci,drive=store"]
+                   "-drive", f"if=none,file={disk},format=raw,id=store", "-device", "virtio-blk-pci,drive=store"]
+        if phase == "duplicate":
+            duplicate = work / "duplicate-second.img"
+            duplicate.write_bytes(before)
+            command += ["-drive", f"if=none,file={duplicate},format=raw,id=duplicate",
+                        "-device", "virtio-blk-pci,drive=duplicate"]
         try:
             result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
             text = result.stdout
@@ -144,9 +177,18 @@ def main() -> None:
         if f"EFIVAR_QEMU_PASS-{phase}".encode() not in text or b"EFIVAR_QEMU_FAIL-" in text:
             print(text.decode(errors="replace"))
             raise SystemExit(f"VM {phase} gate failed; exact console evidence: {log}")
-        if phase == "blank" and image.read_bytes() != bytes(1048576):
-            raise SystemExit("Blank store was modified by the kernel")
+        after = disk.read_bytes()
+        if phase in ("blank", "missing", "duplicate") and after != before:
+            raise SystemExit(f"Rejected {phase} store was modified by the kernel")
+        if phase == "duplicate" and duplicate.read_bytes() != before:
+            raise SystemExit("Rejected duplicate store was modified by the kernel")
+        if args.partuuid:
+            if after[:offset] != before[:offset] or after[offset + size:] != before[offset + size:]:
+                raise SystemExit(f"VM {phase} wrote outside the store partition")
+            image.write_bytes(after[offset:offset + size])
     print(f"PASS: immediate read, update, delete, reboot, firmware compaction, torn-tail reread and blank refusal without writes; image: {work / 'store.img'}")
+    if args.partuuid:
+        print("PASS: PARTUUID selection, missing and duplicate refusal without writes, and partition write boundaries")
 
 
 if __name__ == "__main__":
