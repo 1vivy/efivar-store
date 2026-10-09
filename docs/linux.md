@@ -97,8 +97,9 @@ register ours, restore generic operations on registration failure or removal.
 Other registered backends are not evicted. Unregister excludes callbacks before
 freeing buffers. Do not unload with efivarfs mounted.
 
-Android/GBL has no EFI system table, so esu supplies `dev`. Native discovery via
-the EFVS EFI configuration-table GUID remains the **in-tree upstreaming route**:
+Android/GBL has no EFI system table, so boot configuration supplies an explicit
+UUID or device selector. Native discovery via the EFVS EFI configuration-table
+GUID remains the **in-tree upstreaming route**:
 ACK's boot-only parser discards unknown GUIDs and releases the table arrays. It
 would need a recognized GUID entry in `efi_config_parse_tables` and retained
 decoded descriptor, not scanning reclaimable boot memory from an external LKM.
@@ -171,6 +172,13 @@ kernel's codegen/security ABI. The pinned Rust 1.99 nightly supports these
 unstable codegen switches. Changing target configuration or flags rebuilds all
 engine/core/compiler-builtins objects; no mitigation is disabled globally.
 
+The x86 target also sets `plt-by-default=true`. The bare-metal base defaults to
+no PLT and made LLVM-lowered memory calls emit `R_X86_64_GOTPCREL`, even with
+static relocation and kernel code model. ACK rejects that userspace-GOT form
+at module load. Direct PLT32 calls retain the configured mitigations and resolve
+to the kernel's genuine helpers. Product admission checks relocation types in
+allocated sections as well as symbols/CRCs; debug-only relocations are not loaded.
+
 An objtool mitigation/IBT warning is a failed build/admission, even if make returns
 zero. The product KMI builder preserves the full `.build.log`, rejects objtool
 diagnostics, and does not emit an admitted receipt. The Android generalized gate
@@ -218,7 +226,7 @@ The final C-glue backend was built and admitted against ACK
 | Architecture | CRC-versioned imports | Admitted private imports |
 | --- | ---: | ---: |
 | aarch64 | 46 | 8 |
-| x86_64 | 57 | 0 |
+| x86_64 | 56 | 0 |
 
 ARM private imports are `efivars_generic_ops_register`,
 `efivars_generic_ops_unregister`, `efivars_register`, `efivars_unregister`,
@@ -236,6 +244,11 @@ also passed through the quoted wrapper, produced the matching vermagic and signe
 `efivar_store.ko` with an ephemeral test certificate. Source, DKMS state, module
 output, temporary files and signing material stayed in isolated unprivileged
 trees. No system install, key enrollment or host module load was performed.
+
+The original x86 artifact passed CRC admission but failed its first Cuttlefish
+load with `Unknown rela relocation: 9`. After the target correction, ELF
+inspection found zero GOTPCREL references (previously 23), and the stricter
+admission gate rejected the old artifact while accepting the corrected module.
 
 ## Exercised round-trip
 
@@ -256,12 +269,23 @@ device or product default. `--partuuid` requires `sfdisk`, wraps the initialized
 EFVS image in a real GPT partition, and boots it through the kernel partition
 parser. Omit it to exercise the explicit `dev=major:minor` path.
 
+For x86_64 use `--arch x86_64` and matching x86 inputs. The test kernel needs
+SysRq support: the guest syncs and requests reboot through `/proc/sysrq-trigger`;
+QEMU's `-no-reboot` exits the VM. This does not require a BusyBox poweroff applet.
+Guest output goes through `/dev/kmsg` and the configured early console. A timeout
+or nonzero QEMU exit fails the gate even if an earlier phase marker was printed.
+
 The shipped loader and final ARM backend passed seven VM phases: missing UUID,
 duplicate UUID, write/update/delete, reboot/read, firmware compaction, torn-tail
 reread, and blank refusal. Missing and duplicate selectors returned ENODEV and
 EEXIST respectively. Host comparisons confirmed no writes to rejected disks and
 no writes outside the selected GPT partition. Logs:
 `/var/tmp/efvs-final-uuid-proof-20261009/{missing,duplicate,write,read,compact,torn,blank}.log`.
+
+The corrected x86_64 backend and production loader also passed all seven phases
+against the stock Cuttlefish kernel, including byte-for-byte rejected-disk and
+partition-boundary comparisons. Evidence:
+`/var/tmp/efvs-x64-final-proof-20261009/{missing,duplicate,write,read,compact,torn,blank}.log`.
 
 The host suite covers FFI changed-range preservation, create/update/append/
 delete/replay/iteration, policy precedence, query sizing, exhaustion without

@@ -22,6 +22,9 @@ def target_for_kernel(base: dict, config: str) -> dict:
         features += ["+harden-sls-ijmp", "+harden-sls-ret"]
     target["features"] = ",".join(features)
     target["code-model"] = "kernel"
+    # Kernel modules resolve direct PLT32 calls; they have no userspace GOT.
+    # The bare-metal base's no-PLT default makes LLVM libcalls use GOTPCREL.
+    target["plt-by-default"] = True
     target["disable-redzone"] = True
     target["emit-debug-gdb-scripts"] = False
     target["frame-pointer"] = "may-omit"

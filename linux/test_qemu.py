@@ -43,8 +43,7 @@ def init_script(phase: str, transports: list[str], relocating: bool, loader_args
 {loader} /lib/efivar_store.ko {selector} && fail {phase}-accepted
 /bin/busybox test ! -d /sys/module/efivar_store || fail rejected-backend-present
 echo EFIVAR_QEMU_PASS-{phase}
-/bin/busybox poweroff -f
-while :; do :; done
+shutdown
 """ if phase in ("blank", "missing", "duplicate") else ""
     actions = r"""
 /bin/busybox printf '\007\000\000\000first' > "$keep" || fail set
@@ -62,8 +61,11 @@ while :; do :; done
 """
     return (f"""#!/bin/busybox sh
 export PATH=/bin
-fail() {{ echo EFIVAR_QEMU_FAIL-$1; /bin/busybox dmesg; /bin/busybox poweroff -f; while :; do :; done; }}
+shutdown() {{ /bin/busybox sync; echo b > /proc/sysrq-trigger; while :; do :; done; }}
+fail() {{ echo EFIVAR_QEMU_FAIL-$1; /bin/busybox dmesg; shutdown; }}
 /bin/busybox mkdir -p /proc /sys /dev /efivars /lib
+/bin/busybox test -e /dev/kmsg || /bin/busybox mknod /dev/kmsg c 1 11
+exec >/dev/kmsg 2>&1
 /bin/busybox mount -t proc proc /proc || fail proc
 /bin/busybox mount -t sysfs sysfs /sys || fail sysfs
 {loads}
@@ -80,14 +82,14 @@ deleted=/efivars/Deleted-{GUID}
 {actions}
 /bin/busybox sync
 echo EFIVAR_QEMU_PASS-{phase}
-/bin/busybox poweroff -f
-while :; do :; done
+shutdown
 """).encode()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kernel-out", type=Path, required=True)
+    parser.add_argument("--arch", choices=("aarch64", "x86_64"), default="aarch64")
     parser.add_argument("--backend", type=Path, required=True)
     parser.add_argument("--frontend", type=Path, required=True)
     parser.add_argument("--busybox", type=Path, required=True)
@@ -118,9 +120,14 @@ def main() -> None:
         if path.exists():
             files[f"lib/{path.name}"] = (path.read_bytes(), stat.S_IFREG | 0o644)
             transports.append(path.name)
-    qemu = shutil.which("qemu-system-aarch64")
+    x86 = args.arch == "x86_64"
+    qemu_name = "qemu-system-" + args.arch
+    qemu = shutil.which(qemu_name)
     if qemu is None:
-        raise SystemExit("qemu-system-aarch64 is missing")
+        raise SystemExit(f"{qemu_name} is missing")
+    kernel = args.kernel_out / ("arch/x86/boot/bzImage" if x86 else "arch/arm64/boot/Image")
+    console = ("console=ttyS0 earlyprintk=serial,ttyS0,115200 keep_bootcon" if x86
+               else "console=ttyAMA0 earlycon=pl011,0x9000000")
     phases = (["missing", "duplicate"] if args.partuuid else []) + ["write", "read", "compact", "torn", "blank"]
     for phase in phases:
         if phase == "blank":
@@ -157,9 +164,9 @@ def main() -> None:
                 output.seek(offset)
                 output.write(image.read_bytes())
         before = disk.read_bytes()
-        command = [qemu, "-machine", "virt", "-cpu", "max", "-m", "1024", "-smp", "2", "-nographic", "-no-reboot",
-                   "-kernel", str(args.kernel_out / "arch/arm64/boot/Image"), "-initrd", str(initrd),
-                   "-append", "console=ttyAMA0 earlycon=pl011,0x9000000 rdinit=/init panic=-1 nokaslr",
+        command = [qemu, "-machine", "q35" if x86 else "virt", "-cpu", "max", "-m", "1024", "-smp", "2", "-nographic", "-no-reboot",
+                   "-kernel", str(kernel), "-initrd", str(initrd),
+                   "-append", f"{console} rdinit=/init panic=-1 nokaslr",
                    "-drive", f"if=none,file={disk},format=raw,id=store", "-device", "virtio-blk-pci,drive=store"]
         if phase == "duplicate":
             duplicate = work / "duplicate-second.img"
@@ -169,12 +176,14 @@ def main() -> None:
         try:
             result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
             text = result.stdout
+            completed = result.returncode == 0
         except subprocess.TimeoutExpired as error:
             text = error.stdout or b""
+            completed = False
         log = work / f"{phase}.log"
         log.write_bytes(text)
         print(f"{phase}: {log}")
-        if f"EFIVAR_QEMU_PASS-{phase}".encode() not in text or b"EFIVAR_QEMU_FAIL-" in text:
+        if not completed or f"EFIVAR_QEMU_PASS-{phase}".encode() not in text or b"EFIVAR_QEMU_FAIL-" in text:
             print(text.decode(errors="replace"))
             raise SystemExit(f"VM {phase} gate failed; exact console evidence: {log}")
         after = disk.read_bytes()
