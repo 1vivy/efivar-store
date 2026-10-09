@@ -128,6 +128,13 @@ packaging with a configured kernel output. Unless explicitly overridden, `LLVM`
 follows that kernel's `CONFIG_CC_IS_CLANG`: Clang for a Clang kernel, GCC
 otherwise. Ordinary modpost errors remain fatal; DKMS installs no relocating
 loader.
+
+The DKMS entry quotes its leading `'make'` so DKMS does not inject
+`KERNELRELEASE` into the outer wrapper. Only the recursive kernel build sets
+that variable; setting it on the wrapper selects Kbuild without its `src`
+context. `KMI_SRC=${kernel_source_dir}` selects the requested kernel rather
+than the running host. `AUTOINSTALL=no` excludes this package from DKMS autoinstall.
+
 Rust code generation uses static relocations, one codegen unit, no embedded LLVM bitcode, and no forced
 unwind tables. Kbuild links the C object and a garbage-collected `ld -r
 --whole-archive` Rust object into one `efivar_store.ko`, retaining only the FFI
@@ -223,6 +230,12 @@ Standalone builds against `7.2.8-2-cachyos` (Clang) and
 `6.18.52-1-cachyos-lts` (GCC) passed with `ARCH=x86`, native compiler selection,
 fatal modpost and no objtool diagnostics. These are build results, not claims of
 loading either module into the workstation kernel.
+
+An actual DKMS 3.4.3 `add`/`build` for `6.18.52-1-cachyos-lts`, `ARCH=x86_64`,
+also passed through the quoted wrapper, produced the matching vermagic and signed
+`efivar_store.ko` with an ephemeral test certificate. Source, DKMS state, module
+output, temporary files and signing material stayed in isolated unprivileged
+trees. No system install, key enrollment or host module load was performed.
 
 ## Exercised round-trip
 
