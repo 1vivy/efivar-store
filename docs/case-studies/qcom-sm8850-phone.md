@@ -20,7 +20,7 @@ The names in play, so the rest reads unambiguously:
 | `VariableDxe` | Qualcomm DXE driver producing `gEfiVariableServicesProtocolGuid` | firmware |
 | `uefisecapp` | TrustZone app `qcom.tz.uefisecapp`, the SCM-backed variable owner | TZ, `uefisecapp_a`/`_b` |
 | efisp / Surfacer | our UEFI payload; owns the runtime-variable hijack | ESP / critical |
-| `kernelesp` | our kernel modules; `efivarfs.ko` registers the block-backed backend | Android kernel |
+| `maos-lkms` | our kernel modules; `efivarfs.ko` registers the block-backed backend | Android kernel |
 | EFVS | planned successor format: checkpoint + hash-chained log, verification at boot | not shipped |
 
 ## 1. Platform posture as found
@@ -301,9 +301,10 @@ The kernel has one variable backend, so the OS-side answer is not "a second vari
 backend the kernel already has, over our partition". The historical edk2 C backend below and the
 current EFVS C-glue backend agree on that mechanism; only EFVS is shipped by this repository now:
 
-- **`kernelesp/modules/efivarfs`** — the bundled ACK `efivarfs` sources (android16-6.12, KMI generation
-  6, `PROVENANCE.md:1-6`) plus a 310-line C engine `bdsvars.c`: "Block-backed edk2 authenticated
-  variable store. No runtime firmware calls." (`bdsvars.c:1-2`).
+- **The pre-split kernel-module tree's `efivarfs`** — the bundled ACK `efivarfs` sources (android16-6.12,
+  KMI generation 6, `PROVENANCE.md:1-6`) plus a 310-line C engine `bdsvars.c`: "Block-backed edk2
+  authenticated variable store. No runtime firmware calls." (`bdsvars.c:1-2`). Its current home is
+  `maos-lkms`'s `kernel/efivarfs`.
 - **The current EFVS backend** (`linux/efivar_store.c`) registers the same operation
   set through C glue linked to the audited Rust engine's freestanding static library.
   It does not use Rust-for-Linux or import kernel Rust crates; see [the Linux guide](../linux.md).
@@ -312,13 +313,13 @@ The historical C engine illustrates the registration mechanism (its edk2 storage
 
 - The engine is handed a resolved `major:minor` (`module_param(dev, …)`, "required bdsvars block device
   major:minor", `bdsvars.c:16-20`); partition discovery is the init's job (`bdsvars` by PARTNAME,
-  `userspace/esuinit/src/init.rs:221-235`). The kernel side never scans GPT, which keeps it under the
+  the then-current userspace init, `init.rs:221-235`). The kernel side never scans GPT, which keeps it under the
   vendor-module constraints.
 - It validates the image exactly as this crate does — `_FVH`, `gEfiSystemNvDataFvGuid`, the declared
   length, the authenticated store GUID, `0x5a`/`0xfe` (`bdsvars.c:73-100`) — and serves `get_variable`,
   `get_next_variable`, `set_variable` and `query_variable_info` from one RAM image under a mutex
-  (`bdsvars.c:139-177`, `:258-270`), installing them with
-  `efivars_register(&esu_efivars, &esu_ops)` (`bdsvars.c:287`). The filesystem is upstream `efivarfs`
+  (`bdsvars.c:139-177`, `:258-270`) and installs them through the kernel's
+  `efivars_register` (`bdsvars.c:287`). The filesystem is upstream `efivarfs`
   (`super.c`, `inode.c`, `file.c`, `vars.c`), driven through the kernel's exported
   `efivar_get_next_variable`/`efivar_set_variable_locked` (`vars.c:402-404`, `:660-661`).
 - Writes follow the same edk2 FTW order as `persist::apply`: retire the predecessor with `0xfe`, write
@@ -333,14 +334,14 @@ The historical C engine illustrates the registration mechanism (its edk2 storage
   re-entered through `SetVariable` before `EBS`.
 
 One deviation from verbatim upstream is deliberate and load-bearing: `vars.c` adds
-`{ ESU_PROJECT_GUID, "*", NULL }` to the removable-variable table (`PROVENANCE.md:16-21`,
-`vars.c:184-185`, `esu-guid.h:5`), without which upstream `inode.c:33` marks the files and they are
+the project GUID to the removable-variable table (`PROVENANCE.md:16-21`,
+`vars.c:184-185`, the project GUID header), without which upstream `inode.c:33` marks the files and they are
 immutable. A second, documented consequence is left unpatched: "Stock `super.c` gates statfs on EFI
 runtime-service support, so its statfs capacity reporting may remain zero on a non-EFI Android kernel
 even though the backend's query operation reports the actual store geometry" (`PROVENANCE.md:130-133`).
 
 **Proven so far, on the phone**: the block-backed backend loads from userspace and efivarfs serves the
-real partition. `espinitd insmod efivarfs.ko dev=259:93` resolved 22 non-KMI imports, dmesg logged
+real partition. The then-current userspace init's `insmod efivarfs.ko dev=259:93` resolved 22 non-KMI imports, dmesg logged
 `efivars: Registered efivars operations`, there was no `/sys/firmware/efi` on that boot so no competing
 backend, and `mount -t efivarfs -o ro` listed exactly the two live records whose bytes matched the
 offline image read by the host `bdsvars` CLI (`records/20261006T073500Z-phone-efivarfs-userspace`,
@@ -449,11 +450,10 @@ Workspace evidence (paths are relative to `~/Projects/efisp-projects`):
 - `gobbl-lab/docs/device-results.md` (142-151, 182) and the records named in section 4.1, plus
   `20260929T065938Z-phone-baseline`, `20261004T013922Z-phone-layout`,
   `20261004T034826Z-provision-replica`, `20261007T175802Z-provision-replica`.
-- `kernelesp/modules/efivarfs/` (`bdsvars.c`, `PROVENANCE.md`, `esu-guid.h`, `vars.c`, `super.c`,
-  `inode.c`, `file.c`, `test/`), `kernelesp/README.md` (11, 13, 130),
-  `kernelesp/userspace/esuinit/src/init.rs` (221-235, 289-300),
-  `kernelesp/userspace/esu-platform/src/efivars.rs` (2-3, 10-13, 62-69, 117-159),
-  `kernelesp/payloads/boot-hal/src/backend.rs`, `kernelesp/esu/modules/boot-hal/sepolicy.rule`.
+- The pre-split workspace's kernel-side tree: the bundled `efivarfs` module sources (`bdsvars.c`,
+  `PROVENANCE.md`, the project GUID header, `vars.c`, `super.c`, `inode.c`, `file.c`, `test/`) and its
+  README (11, 13, 130); its userspace init `init.rs` (221-235, 289-300); its userspace platform
+  `efivars.rs` (2-3, 10-13, 62-69, 117-159); its boot-HAL `backend.rs` and boot-HAL `sepolicy.rule`.
 - Linux: `linux-on-sm8850/uefisecapp-probe/linux/drivers/firmware/qcom/qcom_qseecom_uefisecapp.c`
   (1-8, 30-34, 794-799, 831), `qcom_scm.c` (90-121, 2155-2167, 2207-2228, 2261-2270, 2285-2323,
   2333-2360), `qcom_qseecom.c:86-88`, `drivers/firmware/qcom/Kconfig:61-73`,

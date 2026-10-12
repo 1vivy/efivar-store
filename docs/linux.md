@@ -119,7 +119,7 @@ make -C linux KMI_SRC=/path/to/phone-common KMI_OUT=/path/to/gki-out \
 ```
 
 The Makefile works both through its outer target and direct ACK kbuild (including
-kernelsu-esp's pinned-source builder). It builds the staticlib offline with pinned
+the egysk pinned-source builder). It builds the staticlib offline with pinned
 `nightly-2026-08-08`, `-Z build-std=core,compiler_builtins`, and installed `rust-src`;
 no downloaded softfloat target is needed. Override `CARGO`, `EFVS_RUSTC` and
 `RUST_TOOLCHAIN` only with an equivalently supported toolchain. Cargo explicitly
@@ -212,9 +212,10 @@ not LLVM bitcode or kernel Rust metadata: do not pass mixed-version bitcode
 between Rust and the kernel linker.
 
 Generic kernels with suitable exports can use insmod/modprobe. Trimmed Android
-GKI protects or omits some C exports, so kernelesp's production relocating loader
-resolves undefined symbols against kallsyms before invoking init_module. It does
-not itself apply AArch64 relocations: ACK's `arch/arm64/kernel/module.c` does.
+GKI protects or omits some C exports, so the egysk `lkm-loader` production
+relocating loader resolves undefined symbols against kallsyms before invoking
+init_module. It does not itself apply AArch64 relocations: ACK's
+`arch/arm64/kernel/module.c` does.
 Successful CRC/System.map admission alone is not a runtime proof.
 
 The phone has efivarfs disabled in its kernel. The independent LKM product ships
@@ -263,7 +264,7 @@ python3 -m unittest discover -s linux -p 'test_rust*.py'
 python3 linux/test_qemu.py --kernel-out /path/to/gki-out \
   --backend /path/to/arm64/efivar_store.ko --frontend /path/to/efivarfs.ko \
   --busybox /path/to/static-arm64-busybox --cli target/debug/efivar-store \
-  --loader /path/to/ksuinit --loader-arg=--load-module \
+  --loader /path/to/lkm-loader --loader-arg=--dir --loader-arg=/lib/kmod \
   --partuuid f5a3bc0f-4dea-56c6-aeed-cb638157a125 \
   --work /var/tmp/efvs-uuid-proof
 ```

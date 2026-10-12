@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """EFVS VM set/update/delete/reboot, offline firmware compaction and torn-tail reread.
 
-Inputs must be built against the SAME kernel output. Trimmed GKI uses esu's
-production relocating loader; ordinary insmod remains a diagnostic option.
+Inputs must be built against the SAME kernel output. Trimmed GKI uses the
+egysk `lkm-loader` production relocating loader; ordinary insmod remains a
+diagnostic option.
 """
 import argparse
 from pathlib import Path
@@ -96,7 +97,7 @@ def main() -> None:
     parser.add_argument("--cli", type=Path, required=True)
     parser.add_argument("--work", type=Path)
     parser.add_argument("--loader", type=Path, help="Static relocating module loader for trimmed GKI")
-    parser.add_argument("--loader-arg", action="append", default=[], help="Argument preceding the module path; use --loader-arg=--load-module for esuinit")
+    parser.add_argument("--loader-arg", action="append", default=[], help="Argument preceding the module path; use --loader-arg=--dir for the egysk lkm-loader payload list")
     parser.add_argument("--partuuid", type=uuid.UUID, help="Exercise GPT partition selection, including missing and duplicate UUID refusal; requires sfdisk")
     args = parser.parse_args()
     if args.loader_arg and not args.loader:
