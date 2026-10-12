@@ -1,6 +1,6 @@
 # Case study: runtime variables on a production Qualcomm phone (OnePlus 15, SM8850)
 
-**Status (2026-10-07)** — what the lab and the source say about the UEFI variable posture of the
+**Status (2026-10-12)** — what the lab and the source say about the UEFI variable posture of the
 Qualcomm SM8850 phone this project runs on (OnePlus 15, `infiniti`, OOS 16 / Android 16), why the
 operating system has no writable variables, and how a block-backed store on an appended GPT
 partition is presented to both firmware and kernel as *the* variable service.
@@ -27,7 +27,7 @@ The names in play, so the rest reads unambiguously:
 
 **The firmware's variable services are real, storage-backed and boot-services-only.** The device census
 shows `gEfiVariableServicesProtocolGuid` (F9085B9D) with one handle, and "only `VariableDxe.inf`
-produces it, not `EmuVariableRuntimeDxe`" (`gobbl-lab/legacy/docs-history/goal-1-bringup.md:172`). The
+produces it, not `EmuVariableRuntimeDxe`" (`gobbl-lab/legacy/records/docs-history/goal-1-bringup.md:172`). The
 shipping producer is not byte-for-byte the reference BSP driver: the census does not show
 `gEdkiiVariablePolicyProtocol` (81D1675C), which the BSP's `VariableDxe.inf` also produces
 (`legacy/docs-history/open-qualifiers.md:205`). The reference BSP FDF that ships `SocPkg` for
@@ -44,7 +44,7 @@ four variable entry points on `EfiAtRuntime()` and returns `EFI_UNSUPPORTED`
 - At runtime the store is unreachable through the firmware, on all four operations.
 
 **Measured on the phone, before any of our runtime code is published**
-(`gobbl-lab/records/20260929T204501Z-phone-loop`, read-only probe; `docs/device-results.md:142`):
+(`gobbl-lab/legacy/records/20260929T204501Z-phone-loop`, read-only probe; `docs/device-results.md:142`):
 
 ```
 rt_properties absent
@@ -442,7 +442,7 @@ Workspace evidence (paths are relative to `~/Projects/efisp-projects`):
 - `gobbl/surfacer/app/src/variables.rs` (1-5, 164-168), `variables/mechanism.rs` (1-9, 377-386, 516-519,
   580-583), `variables/properties.rs` (3-8, 71-78), `lab/runtime_survey.rs` (1-10, 20-27).
 - `gobbl/crates/provision-core/src/gpt.rs` (42-54, 969-980, 1076-1111).
-- `gobbl-lab/legacy/docs-history/gpt-esp-varstore-investigation.md` (93-94, 113-134, 154-162, 176-178),
+- `gobbl-lab/legacy/records/docs-history/gpt-esp-varstore-investigation.md` (93-94, 113-134, 154-162, 176-178),
   `goal-1-bringup.md:172`, `open-qualifiers.md` (205, 207), `research-gaps.md` (52, 126),
   `implementation-notes.md:291`, `plan-breakers.md:247,323`, `device-probe-plan.md` (68-71, 97-105, 201,
   231, 250), `lu0-storage-plan.md` (29, 73-75), `multi-rom-investigation.md:28`.
@@ -460,4 +460,4 @@ Workspace evidence (paths are relative to `~/Projects/efisp-projects`):
   `drivers/firmware/efi/vars.c` (26-41, 68-95), `fs/efivarfs/super.c` (361-362, 505-506),
   `include/linux/efi.h:1050-1062`, and the probe's `out/config` /
   `0001-allowlist-oneplus-infiniti.patch`.
-- `gobbl-lab/records/20260930T025853Z-phone-harvest` for the harvested console of the TrustZone probe.
+- `gobbl-lab/legacy/records/20260930T025853Z-phone-harvest` for the harvested console of the TrustZone probe.
