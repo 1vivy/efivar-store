@@ -3,7 +3,8 @@
 **Status (2026-10-08)** — EFVS v1 is the live block-backed EFI variable container:
 A/B checkpoints plus a hash-chained append log, with shared allocation-free `no_std`
 serializers and replay for firmware and Linux. The existing edk2 FV engine remains
-unchanged for import/export, inspection and migration of existing stores.
+unchanged for inspection and editing of existing stores; the two containers have
+no converter.
 Compaction writes the inactive checkpoint and its generation/CRC header, with
 flush barriers before clearing the log. Header copies occupy distinct physical
 write units (4096 bytes by default), so a torn sector cannot destroy both.
@@ -12,12 +13,12 @@ The 1 MiB phone profile reserves two 128 KiB checkpoint slots and a 778240-byte 
 ## Components
 
 1. **[UEFI variable service](docs/uefi.md)** (`crates/efivar-store-uefi`): `no_std` + boot-time
-   `alloc`, EFVS boot replay/compaction and crash-safe first-boot migration, original-firmware
+   `alloc`, EFVS boot replay/compaction and blank-partition initialisation, original-firmware
    forwarding, volatile overlay, durable append updates, EFVS/runtime-table publication and
    frozen read-only AArch64/x86-64 runtime thunks.
    This is a library linked into an application, **not a standalone runtime DXE image**.
 2. **Storage engine** (`crates/efivar-store`): the EFVS v1 container ([spec](docs/efvs-v1.md)),
-   the edk2 NV engine for interoperability and migration, and the pure `auth` rules.
+   the edk2 NV engine for interoperability, and the pure `auth` rules.
 3. **[Linux backend](docs/linux.md)** (`linux/`): a C-glue efivars module linking the
    allocation-free Rust engine through `crates/efivar-store-ffi`. It serves the kernel's
    own efivarfs without kernel Rust crates or Rust-mangled imports.
@@ -91,8 +92,8 @@ The byte layouts of all three, with offsets, are in [docs/format.md](docs/format
 
 ### UEFI service
 
-Use `efivar-store-uefi` from `crates/efivar-store-uefi`; supply a `BlockBackend` with primary
-and migration-journal I/O, namespace `Policy`, `Manifest`, verifier, anchor, live system table
+Use `efivar-store-uefi` from `crates/efivar-store-uefi`; supply a `BlockBackend` over the
+partition, a namespace `Policy`, `Manifest`, verifier, anchor, live system table
 and diagnostic callback to `VariableService::install`. Install before any variable consumers;
 downstream applications use ordinary gRT calls. See [the lifecycle contract](docs/uefi.md).
 
@@ -145,8 +146,6 @@ cargo run --locked -p efivar-store-cli -- --image store.img delete \
 
 `--efvs` selects the live container; omit it for an edk2 interoperability FV.
 `compact --image store.img` is an explicit offline firmware-equivalent operation.
-`import-edk2 --from old.fd --image new.img --size 1048576` preserves live edk2
-variables in a fresh EFVS checkpoint (boot policy still drops authenticated keys).
 EFVS set/delete/oneshot append only one record and fsync; they never rewrite the
 whole image or reclaim on exhaustion. The shared serializer supplies these bytes.
 

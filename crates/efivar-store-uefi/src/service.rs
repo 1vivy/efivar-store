@@ -21,7 +21,7 @@ mod firmware;
 pub mod mechanism;
 pub mod memory_map;
 mod properties;
-/// Persistent store and consumer-owned first-boot migration journal.
+/// Persistent store with the UEFI status type, as the engine's backend.
 pub trait BlockBackend: crate::backend::Storage<Error = Status> {}
 impl<T: crate::backend::Storage<Error = Status>> BlockBackend for T {}
 struct Backend(Box<dyn BlockBackend>);
@@ -41,17 +41,7 @@ impl Flush for Backend {
         self.0.flush()
     }
 }
-impl crate::backend::Storage for Backend {
-    fn backup_read(&mut self, offset: usize, bytes: &mut [u8]) -> Result<(), Status> {
-        self.0.backup_read(offset, bytes)
-    }
-    fn backup_write(&mut self, offset: usize, bytes: &[u8]) -> Result<(), Status> {
-        self.0.backup_write(offset, bytes)
-    }
-    fn backup_flush(&mut self) -> Result<(), Status> {
-        self.0.backup_flush()
-    }
-}
+impl crate::backend::Storage for Backend {}
 
 struct Verifier(Box<dyn efvs::Verifier>);
 impl efvs::Verifier for Verifier {

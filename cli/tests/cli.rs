@@ -379,8 +379,8 @@ fn init_writes_a_standalone_store_image() {
 }
 
 #[test]
-fn efvs_cli_roundtrip_compact_and_import() {
-    let (dir, old) = scenario();
+fn efvs_cli_roundtrip_and_compact() {
+    let (dir, _edk2) = scenario();
     let image = dir.join("efvs.img");
     let path = image.to_str().unwrap();
     ok(&run(&[
@@ -450,16 +450,5 @@ fn efvs_cli_roundtrip_compact_and_import() {
     );
     ok(&run(&["--image", path, "oneshot", "linux.conf"]));
     ok(&run(&["--image", path, "oneshot", "--clear"]));
-    ok(&run(&[
-        "import-edk2",
-        "--from",
-        old.to_str().unwrap(),
-        "--image",
-        path,
-        "--size",
-        "1048576",
-        "--force",
-    ]));
-    assert!(ok(&run(&["--image", path, "inspect"])).contains("live variables: 0"));
     std::fs::remove_dir_all(dir).unwrap();
 }

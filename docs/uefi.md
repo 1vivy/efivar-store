@@ -9,15 +9,15 @@ allocation-free. The sole UEFI ABI dependency is `r-efi = 6.0.0`, resolved offli
 
 1. **Manifest (consumer).** Discover and validate the partition. Supply `backend::Manifest`
    (size, initial checkpoint capacity, physical write unit, unique GPT GUID), a
-   `service::BlockBackend` implementing `backend::Storage` (primary `Read`/`Write`/`Flush`
-   plus independently flushed migration-journal I/O), a namespace `Policy`, a verifier and
-   anchor. Journal pathname/lifecycle, project/BLI GUIDs, size, logging and trail marks are
-   consumer policy. Absent journal reads are zero; create/extend happens only on journal writes.
+   `service::BlockBackend` implementing `backend::Storage` (primary `Read`/`Write`/`Flush`),
+   a namespace `Policy`, a verifier and anchor. Project/BLI GUIDs, size, logging and
+   trail marks are consumer policy.
 2. **Install at application start, before any variable consumers or children.** Call
    `VariableService::install(table, backend, manifest, policy, verifier, anchor, report)`.
-   Only one installation is permitted. A blank/unrecognized partition is initialized as
-   EFVS; an edk2 image is imported once through the transaction below. An EFVS image loads
-   its highest valid generation and replays its log under the caller's `efvs::Verifier`.
+   Only one installation is permitted. An all-zero partition is initialized as EFVS; a
+   non-blank image that is not EFVS is refused with `EFI_COMPROMISED_DATA` — there is no
+   migration path from another container. An EFVS image loads its highest valid
+   generation and replays its log under the caller's `efvs::Verifier`.
    The official caller supplies `PolicyNone` and `NoneAnchor`: no key enrollment, setup mode,
    no cryptographic authenticity or protected rollback guarantee.
    Replay checks the anchor, durably compacts the accepted state and torn/rejected tail,
@@ -50,30 +50,6 @@ If a child returns while boot services are still live, `restore` reverses public
 owned state; dropping the owner also attempts restoration. Never restore or drop it after a
 successful EBS. Retain/leak the owner across that handoff. The application must not unload itself
 while its pre-EBS callbacks or EBS event remain installed.
-
-## First-boot migration and recovery
-
-The primary is never overwritten until the independent journal contains a complete,
-flushed, byte-verified EFVS image plus a committed marker (size, image SHA-256 and marker
-SHA-256). The journal has a 4096-byte marker page followed by the full image. Both initial
-checkpoint slots contain the imported live state: a damaged header must not fall back to
-an empty store. Import failure (including insufficient checkpoint space) leaves the
-original image untouched.
-
-The service writes/verifies the complete body, then each whole physical header block,
-with a flush after every write. A committed journal resumes an interrupted conversion,
-including completing the second pair after the first header was published. Before any
-EFI callbacks or subsequent mutations are exposed, the marker is zeroed, flushed and
-read back. Thus a retained journal body is inert and cannot later roll back an EFVS
-store. A normal EFVS boot needs no full-image ESP mirror: its A/B checkpoints and append
-log own recovery. A stale legacy spare is never treated as an authoritative migration
-source.
-
-Host tests interrupt every journal/primary write and flush, including partial marker
-prefixes and representative body/header tears, then restart the actual service. They
-also cover OS log replay on the next boot, torn-tail compaction, anchor lock and
-firmware-only BS variables. These are logical storage-order tests, not proof that a
-particular firmware filesystem or BlockIo flush is honest.
 
 ## OS discovery
 
@@ -122,7 +98,10 @@ GBL path does not hand the system table to the kernel. Device proof is outside t
   owns the mechanism; diagnostic markers, synthetic proof variables and persistence policy remain
   consumer code.
 - Host tests retain the moved routing, durability, visibility, bounds, capture and x86-64 EFI-ABI
-  differential assertions. An AArch64 compile is not proof of execution on a device.
+  differential assertions, plus OS log replay on the next boot, torn-tail compaction, anchor lock
+  and firmware-only BS variables. These are logical storage-order tests, not proof that a
+  particular firmware filesystem or BlockIo flush is honest. An AArch64 compile is not proof of
+  execution on a device.
 
 ## Build
 

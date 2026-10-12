@@ -23,14 +23,10 @@ pub struct Inspection {
     pub anchor_value: u64,
 }
 
-/// The primary store plus an independently flushed first-boot journal.
-/// An absent journal reads as zeroes; writes create/extend it. Its pathname and
-/// file lifecycle belong to the consumer, never the engine or EFI mechanism.
-pub trait Storage: persist::Flush {
-    fn backup_read(&mut self, offset: usize, bytes: &mut [u8]) -> Result<(), Self::Error>;
-    fn backup_write(&mut self, offset: usize, bytes: &[u8]) -> Result<(), Self::Error>;
-    fn backup_flush(&mut self) -> Result<(), Self::Error>;
-}
+/// The primary store: the whole partition, read, written and flushed as one
+/// device. No second I/O path exists, so the consumer supplies nothing beyond
+/// [`persist::Flush`].
+pub trait Storage: persist::Flush {}
 
 pub struct Efvs<I, V> {
     pub io: I,

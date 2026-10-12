@@ -24,7 +24,6 @@ use efivar_store::{
 mod snapshot_tests;
 struct Memory {
     bytes: Vec<u8>,
-    journal: Vec<u8>,
     writes: usize,
     fail: bool,
 }
@@ -49,19 +48,7 @@ impl Write for Memory {
         Ok(())
     }
 }
-impl Storage for Memory {
-    fn backup_read(&mut self, offset: usize, bytes: &mut [u8]) -> Result<(), ()> {
-        bytes.copy_from_slice(&self.journal[offset..offset + bytes.len()]);
-        Ok(())
-    }
-    fn backup_write(&mut self, offset: usize, bytes: &[u8]) -> Result<(), ()> {
-        self.journal[offset..offset + bytes.len()].copy_from_slice(bytes);
-        Ok(())
-    }
-    fn backup_flush(&mut self) -> Result<(), ()> {
-        Ok(())
-    }
-}
+impl Storage for Memory {}
 impl Flush for Memory {
     fn flush(&mut self) -> Result<(), ()> {
         Ok(())
@@ -101,15 +88,12 @@ impl Firmware for Fake {
         Ok(self.values.clone())
     }
 }
-fn service() -> Service<Memory, Fake> {
-    let mut bytes = vec![0; 64 * 1024];
-    efvs::initialize(&mut bytes, 16 * 1024).unwrap();
+fn open(bytes: Vec<u8>) -> Result<Service<Memory, Fake>, Error> {
     Service::open(
         Memory {
             bytes,
             writes: 0,
             fail: false,
-            journal: vec![0; crate::migration::journal_size(64 * 1024)],
         },
         Fake::default(),
         Manifest {
@@ -122,7 +106,11 @@ fn service() -> Service<Memory, Fake> {
         efvs::PolicyNone,
         &mut efvs::NoneAnchor::new(),
     )
-    .unwrap()
+}
+fn service() -> Service<Memory, Fake> {
+    let mut bytes = vec![0; 64 * 1024];
+    efvs::initialize(&mut bytes, 16 * 1024).unwrap();
+    open(bytes).unwrap()
 }
 fn name(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
@@ -564,4 +552,20 @@ fn failed_boot_compaction_does_not_lock_or_publish_an_anchor() {
     );
     assert!(matches!(result, Err(Error::Device)));
     assert!(!anchor.locked);
+}
+
+#[test]
+fn blank_partition_is_initialized_and_foreign_images_are_refused() {
+    // An all-zero partition is formatted as EFVS and immediately usable.
+    let mut service = open(vec![0; 64 * 1024]).unwrap();
+    assert_eq!(service.list().unwrap().len(), 0);
+    let key = name("BootedRom");
+    service.set(&key, &PROJECT, 7, b"rom1").unwrap();
+    assert_eq!(service.get(&key, &PROJECT).unwrap().data, b"rom1");
+    assert!(efvs::Header::decode(&service.store.io.bytes).is_ok());
+    // Anything else that is not EFVS is refused: there is no conversion path.
+    for byte in [0xff, 0x5a] {
+        let result = open(vec![byte; 64 * 1024]);
+        assert!(matches!(result, Err(Error::Corrupt)), "byte {byte:#04x}");
+    }
 }

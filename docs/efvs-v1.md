@@ -1,8 +1,9 @@
 # EFVS v1: block-backed EFI variables
 
 EFVS is the live container: redundant firmware checkpoints and an append-only runtime log.
-The existing edk2 FV engine is unchanged and remains the import/export/inspection
-and migration interoperability engine. An edk2 FV is not an EFVS checkpoint.
+The existing edk2 FV engine is unchanged and remains the inspection and editing
+interoperability engine. An edk2 FV is not an EFVS checkpoint; the two containers
+have no converter.
 All serializers live in `efivar_store::efvs`; firmware and Linux compile the same
 allocation-free, dependency-free Rust source (Rust 1.82 / edition 2021 compatible).
 `sha256` is the shared SHA-256 implementation; `auth` supplies AUTH_2 parsing.
@@ -111,9 +112,6 @@ Each variable entry:
 Names are nonempty, even-length, valid UTF-16 with no embedded NUL, and at most
 65534 bytes. Duplicate (name, GUID) keys invalidate a checkpoint. Replacing a key
 preserves its enumeration position; insertion appends and deletion closes the gap.
-Migration preserves every live edk2 variable, attributes, value, name/GUID and
-EFI_TIME, including authenticated and BS-only entries. This is byte-data migration,
-not enrollment or signature verification. Boot policy filters imported values.
 
 ### Log record (`efvs_record`)
 
@@ -310,15 +308,14 @@ efivar-store init --efvs --image vars.img --size 1048576
 efivar-store --image vars.img inspect
 efivar-store --image vars.img set --name BootOrder --guid 8be4df61-93ca-11d2-aa0d-00e098032b8c --attributes 7 --data-file order.bin
 efivar-store --image vars.img compact
-efivar-store import-edk2 --from old.fd --image vars.img --size 1048576 --force
 ```
 
 `inspect/list/get/set/delete/oneshot` detect EFVS by header magic; edk2 commands
 remain compatible. EFVS writes lock, reload, append **only the record range**,
-fsync and verify readback. Compaction/import are offline image operations, not
-runtime garbage collection; compact refuses `--device`. Policy None is used by
-the host, so authenticated values imported for preservation disappear from its
-replayed live view. Inspect still reports raw checkpoint count/digest and rejects.
+fsync and verify readback. Compaction is an offline image operation, not runtime
+garbage collection; compact refuses `--device`. Policy None is used by the host,
+so authenticated values disappear from its replayed live view. Inspect still
+reports raw checkpoint count/digest and rejects.
 
 Source: owner's “Block-Backed EFI Variables with Deferred Verification”, 2026-10-07;
 AUTH_2 signing input is UEFI 2.10 §8.2.6 (not §8.2.2, which is enumeration).

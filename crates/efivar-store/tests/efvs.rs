@@ -1,4 +1,4 @@
-use efivar_store::{Layout, Store, StoreMut, auth, efvs::*, migrate};
+use efivar_store::{auth, efvs::*};
 fn name(s: &str) -> Vec<u8> {
     s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
 }
@@ -354,45 +354,6 @@ fn capacity_failure_preserves_image_and_state() {
     );
     assert_eq!(image, before);
 }
-#[test]
-fn edk2_fixture_import_parity_both_layouts() {
-    for layout in [Layout::Normal, Layout::Authenticated] {
-        let mut source = vec![0; 4096];
-        let mut writer = StoreMut::format(&mut source, layout, 4096).unwrap();
-        for (n, attrs, data) in [
-            ("選択𝄞", 7, b"value".as_slice()),
-            ("boot-only", 3, b"firmware"),
-            ("replace", 7, b"old"),
-        ] {
-            writer
-                .set(&n.encode_utf16().collect::<Vec<_>>(), &[2; 16], attrs, data)
-                .unwrap();
-        }
-        writer
-            .set(
-                &"replace".encode_utf16().collect::<Vec<_>>(),
-                &[2; 16],
-                7,
-                b"new",
-            )
-            .unwrap();
-        let mut image = vec![0; 32768];
-        let mut scratch = [0; 4096];
-        let count = migrate::import_edk2(&source, &mut image, 4096, &mut scratch).unwrap();
-        let h = Header::decode(&image).unwrap();
-        let cp = Checkpoint::decode(&image[h.checkpoint_range()]).unwrap();
-        assert_eq!(count, Store::parse(&source).unwrap().list().count());
-        for old in Store::parse(&source).unwrap().list() {
-            let new = cp
-                .variables()
-                .find(|v| v.name == old.name.as_bytes() && v.guid == old.guid)
-                .unwrap();
-            assert_eq!(new.attributes, old.attributes);
-            assert_eq!(new.data, old.data);
-        }
-    }
-}
-
 #[test]
 fn valid_hash_wrong_chain_and_existing_bs_only_are_rejected() {
     let mut image = image();

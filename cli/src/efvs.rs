@@ -38,20 +38,7 @@ pub fn create(args: &Args) -> Result<(), Failure> {
     let capacity = number(args, "--checkpoint", Some(PHONE_CHECKPOINT_CAPACITY))?;
     let block = number(args, "--block", Some(DEFAULT_BLOCK_SIZE))?;
     let mut image = vec![0; size];
-    if args.command()? == "import-edk2" {
-        if block != DEFAULT_BLOCK_SIZE {
-            return Err(Failure::Usage(
-                "import-edk2 uses 4096-byte physical blocks".into(),
-            ));
-        }
-        let source = std::fs::read(args.required("--from")?).map_err(fail)?;
-        let mut scratch = vec![0; capacity];
-        let count = efivar_store::migrate::import_edk2(&source, &mut image, capacity, &mut scratch)
-            .map_err(fail)?;
-        println!("imported {count} variables (policy filtering occurs at replay)");
-    } else {
-        initialize_with_block(&mut image, capacity, block).map_err(fail)?;
-    }
+    initialize_with_block(&mut image, capacity, block).map_err(fail)?;
     let file = OpenOptions::new()
         .write(true)
         .create(true)

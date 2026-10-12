@@ -30,7 +30,6 @@ efivar-store — inspect and update an edk2 NV variable store
 
 usage:
   efivar-store init --image PATH --size BYTES [--efvs --checkpoint BYTES] [--block BYTES] [--layout normal|auth] [--force]
-  efivar-store import-edk2 --from PATH --image PATH --size BYTES [--checkpoint BYTES] [--force]
   efivar-store --image PATH compact
   efivar-store (--device PATH | --image PATH) inspect
   efivar-store (--device PATH | --image PATH) list
@@ -50,7 +49,6 @@ options:
   --force            `init`: overwrite an existing image file
   --efvs             `init`: EFVS v1 live container (otherwise edk2 interop FV)
   --checkpoint BYTES EFVS capacity per checkpoint slot (default 131072; two slots)
-  --from PATH        `import-edk2`: source edk2 image
   --name N           variable name; UTF-8 here, UTF-16LE on disk
   --guid G           EFI GUID in UUID text form, e.g. 4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
   --attributes HEX   EFI attributes, e.g. 0x7 = NV|BS|RT; NV|BS are required
@@ -218,7 +216,7 @@ fn run(args: &Args) -> Result<(), Failure> {
         println!("{USAGE}");
         return Ok(());
     }
-    if command == "import-edk2" || (command == "init" && args.has("--efvs")) {
+    if command == "init" && args.has("--efvs") {
         return efvs::create(args);
     }
     if command != "init" && efvs::detect(args)? {

@@ -20,7 +20,6 @@ pub mod auth;
 #[clippy::msrv = "1.82.0"]
 pub mod efvs;
 mod format;
-pub mod migrate;
 pub mod mirror;
 pub mod persist;
 #[clippy::msrv = "1.82.0"]
