@@ -97,7 +97,7 @@ def main() -> None:
     parser.add_argument("--cli", type=Path, required=True)
     parser.add_argument("--work", type=Path)
     parser.add_argument("--loader", type=Path, help="Static relocating module loader for trimmed GKI")
-    parser.add_argument("--loader-arg", action="append", default=[], help="Argument preceding the module path; use --loader-arg=--dir for the egysk lkm-loader payload list")
+    parser.add_argument("--loader-arg", action="append", default=[], help="Argument preceding the module path; the egysk lkm-loader takes MODULE [PARAMS] directly and needs none")
     parser.add_argument("--partuuid", type=uuid.UUID, help="Exercise GPT partition selection, including missing and duplicate UUID refusal; requires sfdisk")
     args = parser.parse_args()
     if args.loader_arg and not args.loader:

@@ -264,7 +264,7 @@ python3 -m unittest discover -s linux -p 'test_rust*.py'
 python3 linux/test_qemu.py --kernel-out /path/to/gki-out \
   --backend /path/to/arm64/efivar_store.ko --frontend /path/to/efivarfs.ko \
   --busybox /path/to/static-arm64-busybox --cli target/debug/efivar-store \
-  --loader /path/to/lkm-loader --loader-arg=--dir --loader-arg=/lib/kmod \
+  --loader /path/to/lkm-loader \
   --partuuid f5a3bc0f-4dea-56c6-aeed-cb638157a125 \
   --work /var/tmp/efvs-uuid-proof
 ```
