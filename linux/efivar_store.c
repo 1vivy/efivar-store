@@ -529,7 +529,9 @@ static int __init efivar_store_init(void)
 	ready = false;
 	if (rc)
 		return rc;
-	store_file = bdev_file_open_by_dev(device, BLK_OPEN_READ | BLK_OPEN_WRITE, NULL, NULL);
+	/* Own the backing for the callback lifetime, like other block consumers. */
+	store_file = bdev_file_open_by_dev(device, BLK_OPEN_READ | BLK_OPEN_WRITE,
+					 THIS_MODULE, NULL);
 	if (IS_ERR(store_file)) {
 		rc = PTR_ERR(store_file);
 		pr_err("efivar_store: backing device open failed: %d\n", rc);

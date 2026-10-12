@@ -87,8 +87,12 @@ It requires one match: missing UUID is `ENODEV`, ambiguity is `EEXIST`, malforme
 fields are `EINVAL`; I/O errors propagate. No udev by-partuuid link, `block_class`
 private import, boot-only lookup, or root helper is required. Each uevent is read
 after readdir releases its locks, using its opener credentials. Open with
-`bdev_file_open_by_dev(dev, BLK_OPEN_READ | BLK_OPEN_WRITE, NULL, NULL)` and
-recheck the opened partition's UUID before loading bytes, rejecting hotplug
+`bdev_file_open_by_dev(dev, BLK_OPEN_READ | BLK_OPEN_WRITE, THIS_MODULE, NULL)`
+to hold an exclusive block-device claim for the callback lifetime. Competing
+claimants are refused; the existing final `fput` releases the claim after
+callback removal. This also identifies the live backing as an owned consumer
+to partition-protection code, rather than an unclaimed raw partition.
+Recheck the opened partition's UUID before loading bytes, rejecting hotplug
 device-number reuse. Explicit `dev=major:minor` remains independent of sysfs
 UUID enumeration.
 
