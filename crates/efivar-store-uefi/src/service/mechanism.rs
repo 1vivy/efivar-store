@@ -210,22 +210,19 @@ impl Override {
         // constants; make the write visible to instruction fetch before publication.
         unsafe { cache::sync_instruction_cache(code, blob_size) };
         if let Err(error) = seal_runtime_code(services, code_address, code_pages) {
-            // SAFETY: no callback pointer has been published.
-
-            let _ = unsafe { (services.free_pages)(code_address, code_pages) };
+            // Sealing can fail after changing part of the allocation.
+            let _ = release_runtime_code(services, code_address, code_pages);
             return Err(error);
         }
         let mapping = match locate_mapping(services, code_address) {
             Ok(mapping) => mapping,
             Err(error) => {
-                // SAFETY: no callback pointer or event has been published yet.
-                let _ = unsafe { (services.free_pages)(code_address, code_pages) };
+                let _ = release_runtime_code(services, code_address, code_pages);
                 return Err(error);
             }
         };
         if mapping != (efi::RUNTIME_SERVICES_CODE, true) {
-            // SAFETY: no callback pointer or event has been published yet.
-            let _ = unsafe { (services.free_pages)(code_address, code_pages) };
+            let _ = release_runtime_code(services, code_address, code_pages);
             return Err(Status::COMPROMISED_DATA);
         }
 
@@ -261,8 +258,7 @@ impl Override {
             set_variable,
             query_variable_info,
         ) {
-            // SAFETY: no callback pointer has been published.
-            let _ = unsafe { (services.free_pages)(code_address, code_pages) };
+            let _ = release_runtime_code(services, code_address, code_pages);
             return Err(error);
         }
         report(Report::SelfTest);
@@ -278,8 +274,7 @@ impl Override {
             )
         };
         if status.is_error() {
-            // SAFETY: no code pointer has been published.
-            let _ = unsafe { (services.free_pages)(code_address, code_pages) };
+            let _ = release_runtime_code(services, code_address, code_pages);
             return Err(status);
         }
         let private_runtime = match usize::try_from(runtime_address)
@@ -530,15 +525,14 @@ impl Override {
         }
         // SAFETY: the event is closed synchronously and cannot retain context.
         unsafe { drop(Box::from_raw(self.context.as_ptr())) };
-        for (address, pages) in [
-            (self.runtime_address, self.runtime_pages),
-            (self.code_address, self.code_pages),
-        ] {
-            // SAFETY: closed event and restored system table retain no references.
-            let status = unsafe { (services.free_pages)(address, pages) };
-            if status.is_error() {
-                error.get_or_insert(status);
-            }
+        // FreePages may poison released memory; make code writable first.
+        // SAFETY: callback withdrawal and event closure completed above.
+        let status = unsafe { (services.free_pages)(self.runtime_address, self.runtime_pages) };
+        if status.is_error() {
+            error.get_or_insert(status);
+        }
+        if let Err(status) = release_runtime_code(services, self.code_address, self.code_pages) {
+            error.get_or_insert(status);
         }
         PATCH_STATE.store(0, Ordering::Release);
         self.armed = false;
@@ -697,8 +691,101 @@ fn release_pages(
 ) {
     // SAFETY: callers own both exact, unpublished firmware allocations.
     let _ = unsafe { (services.free_pages)(runtime_address, runtime_pages) };
-    // SAFETY: same ownership invariant for the runtime-code allocation.
-    let _ = unsafe { (services.free_pages)(code_address, code_pages) };
+    let _ = release_runtime_code(services, code_address, code_pages);
+}
+
+/// Reclaim only after removing RO. A failed transition deliberately retains the
+/// allocation: firmware allocators are allowed to write into freed pages.
+fn release_runtime_code(
+    services: &efi::BootServices,
+    address: efi::PhysicalAddress,
+    pages: usize,
+) -> Result<(), Status> {
+    let mut interface = ptr::null_mut::<c_void>();
+    // SAFETY: live boot services and writable protocol output.
+    check(unsafe {
+        (services.locate_protocol)(
+            &CPU_ARCH_PROTOCOL_GUID as *const _ as *mut _,
+            ptr::null_mut(),
+            &mut interface,
+        )
+    })?;
+    let protocol = NonNull::new(interface.cast::<CpuArchProtocol>())
+        .filter(|p| p.as_ptr().is_aligned())
+        .ok_or(Status::NOT_FOUND)?;
+    // SAFETY: the GUID-selected interface has the PI CPU architecture ABI.
+    let set = unsafe { protocol.as_ref().set_memory_attributes }.ok_or(Status::UNSUPPORTED)?;
+    let length = pages
+        .checked_mul(PAGE_SIZE)
+        .ok_or(Status::BAD_BUFFER_SIZE)?;
+    let end = address
+        .checked_add(u64::try_from(length).map_err(|_| Status::BAD_BUFFER_SIZE)?)
+        .ok_or(Status::BAD_BUFFER_SIZE)?;
+    for page in (address..end).step_by(PAGE_SIZE) {
+        let attributes = current_cache_attributes(page)?;
+        // SAFETY: each page belongs to this unpublished allocation. Supplying
+        // its actual cache policy without RO removes protection without changing
+        // cacheability; zero is not a valid cache policy on Qualcomm firmware.
+        check(unsafe { set(protocol.as_ptr(), page, PAGE_SIZE as u64, attributes) })?;
+    }
+    // SAFETY: every page is writable and no callback retains this allocation.
+    check(unsafe { (services.free_pages)(address, pages) })
+}
+
+#[cfg(target_arch = "aarch64")]
+fn current_cache_attributes(address: u64) -> Result<u64, Status> {
+    let el: u64;
+    let saved: u64;
+    let par: u64;
+    // SAFETY: this runs only in AArch64 UEFI boot services, at EL1 or EL2.
+    // AT reports translation failure in PAR rather than accessing the page.
+    unsafe {
+        core::arch::asm!(
+            "mrs {el}, CurrentEL",
+            "mrs {saved}, PAR_EL1",
+            el = out(reg) el, saved = out(reg) saved,
+            options(nomem, nostack, preserves_flags),
+        );
+        match el {
+            4 => core::arch::asm!("at s1e1r, {address}", address = in(reg) address,
+                options(nostack, preserves_flags)),
+            8 => core::arch::asm!("at s1e2r, {address}", address = in(reg) address,
+                options(nostack, preserves_flags)),
+            _ => return Err(Status::UNSUPPORTED),
+        }
+        core::arch::asm!(
+            "isb",
+            "mrs {par}, PAR_EL1",
+            "msr PAR_EL1, {saved}",
+            par = out(reg) par, saved = in(reg) saved,
+            options(nostack, preserves_flags),
+        );
+    }
+    if par & 1 != 0 {
+        return Err(Status::NO_MAPPING);
+    }
+    cache_attributes_from_mair((par >> 56) as u8)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn current_cache_attributes(_: u64) -> Result<u64, Status> {
+    // PI's x86 CPU driver treats absent cache bits as a permission-only update:
+    // CpuSetMemoryAttributes skips MTRR changes and updates the page attributes.
+    // Unlike Qualcomm's AArch64 implementation, zero preserves cacheability.
+    Ok(0)
+}
+
+#[cfg(any(target_arch = "aarch64", test))]
+fn cache_attributes_from_mair(attributes: u8) -> Result<u64, Status> {
+    // Exact architectural encodings corresponding to PI CPU cache policies.
+    // Reject other allocation hints/device subtypes rather than change them.
+    match attributes {
+        0xff => Ok(efi::MEMORY_WB),
+        0xbb => Ok(efi::MEMORY_WT),
+        0x44 => Ok(efi::MEMORY_WC),
+        0x00 => Ok(efi::MEMORY_UC),
+        _ => Err(Status::UNSUPPORTED),
+    }
 }
 
 pub(crate) fn refresh_header_crc(
@@ -759,4 +846,23 @@ pub fn published_context() -> Option<&'static mut EventContext> {
     // SAFETY: install pins this context until child return or successful EBS, and
     // clears it only after the event is closed and no callback is active.
     Some(unsafe { context.as_mut() })
+}
+
+#[cfg(test)]
+mod reclamation_tests {
+    use super::*;
+    #[test]
+    fn cache_policy_preserves_architectural_memory_type() {
+        for (mair, policy) in [
+            (0xff, efi::MEMORY_WB),
+            (0xbb, efi::MEMORY_WT),
+            (0x44, efi::MEMORY_WC),
+            (0x00, efi::MEMORY_UC),
+        ] {
+            assert_eq!(cache_attributes_from_mair(mair), Ok(policy));
+        }
+        for mair in [0x04, 0x08, 0x0c, 0xaa, 0xee, 0xf4] {
+            assert_eq!(cache_attributes_from_mair(mair), Err(Status::UNSUPPORTED));
+        }
+    }
 }

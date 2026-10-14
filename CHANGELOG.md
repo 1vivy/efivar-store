@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Port the runtime-code reclamation correction from the divergent gobbl vendored
+  line (`a8dfc861a41674820019023bd1dd896b83e61a58`): remove RO before every
+  post-seal FreePages, preserving actual AArch64 cacheability and retaining
+  protected pages if unsealing fails. Do not infer cache policy from descriptor
+  capability bits or pass zero attributes on Qualcomm.
+
 - Switch the UEFI service's live backend to EFVS: first-boot initialization/import,
   highest-valid-generation replay, durable compaction, anchor bump/lock before publication,
   checked boot-time append updates and EFVS runtime configuration-table publication.

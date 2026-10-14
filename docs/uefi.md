@@ -50,6 +50,28 @@ If a child returns while boot services are still live, `restore` reverses public
 owned state; dropping the owner also attempts restoration. Never restore or drop it after a
 successful EBS. Retain/leak the owner across that handoff. The application must not unload itself
 while its pre-EBS callbacks or EBS event remain installed.
+The service owner must survive every pre-EBS consumer. In gobbl, the independent
+boot-service driver retains it, clears caller-owned load options and refuses
+unload. The installing application can return and unload; subsequent applications
+use ordinary gRT. `restore` and Drop are rollback mechanisms, not child-return
+actions. Never restore or drop the owner after successful EBS. Runtime readers
+use separately allocated runtime code/data, not the driver's boot-time heap.
+
+Before reclaiming copied code, cleanup withdraws callbacks and closes their event,
+then removes read-only protection before `FreePages` (allocators may poison freed
+memory). Every post-seal rollback uses the same release path, including a failed
+sealing call that may have changed part of the allocation. On AArch64, each page's
+actual translation supplies its cache policy; EFI memory-map cache capability bits
+are not a current policy. Unsupported encodings and failed permission transitions
+leave the allocation unfreed. Normal restoration reports the failure; installation
+rollback preserves its original error. On x86-64, the CPU protocol's permission-only
+update leaves MTRRs unchanged. Failed event closure still retains all callback
+backing and requires reset, as below.
+
+If installation fails, `installed()` must be checked before the image can return or unload.
+It remains true when a failed `CloseEvent` retains an EBS callback: event context, copied
+code, private runtime table and referenced snapshot stay allocated. This is a terminal
+ownership outcome requiring a cold reset, not a successful service or a retry opportunity.
 
 ## OS discovery
 
