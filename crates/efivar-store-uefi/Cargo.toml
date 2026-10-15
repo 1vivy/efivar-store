@@ -11,7 +11,7 @@ lab = []
 
 [dependencies]
 efivar-store = { path = "../efivar-store" }
-r-efi = { version = "=6.0.0", default-features = false }
+r-efi = { version = "=7.1.0", default-features = false }
 
 [lints]
 workspace = true

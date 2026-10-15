@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Align the UEFI provider's canonical ABI types with Patina's r-efi 7.1.0;
+  variable routing, wire formats and runtime policy are unchanged.
 - Port the runtime-code reclamation correction from the divergent gobbl vendored
   line (`a8dfc861a41674820019023bd1dd896b83e61a58`): remove RO before every
   post-seal FreePages, preserving actual AArch64 cacheability and retaining
