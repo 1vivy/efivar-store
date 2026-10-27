@@ -62,8 +62,8 @@ impl Header {
             || !self.block_size.is_power_of_two()
             || self.checkpoint_capacity < self.block_size
             || self.checkpoint_capacity > u32::MAX as usize
-            || self.checkpoint_capacity % self.block_size != 0
-            || self.image_size % self.block_size != 0
+            || !self.checkpoint_capacity.is_multiple_of(self.block_size)
+            || !self.image_size.is_multiple_of(self.block_size)
             || (self.header_offset != 0 && self.header_offset != self.block_size)
         {
             return Err(Error::Header);
@@ -121,10 +121,10 @@ impl Header {
         let mut selected = Self::decode_at(image, 0).ok();
         let mut block = MIN_BLOCK_SIZE;
         while block <= MAX_BLOCK_SIZE {
-            if let Ok(candidate) = Self::decode_at(image, block) {
-                if selected.is_none_or(|old| candidate.generation > old.generation) {
-                    selected = Some(candidate);
-                }
+            if let Ok(candidate) = Self::decode_at(image, block)
+                && selected.is_none_or(|old| candidate.generation > old.generation)
+            {
+                selected = Some(candidate);
             }
             block *= 2;
         }

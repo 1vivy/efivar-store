@@ -5,7 +5,9 @@ The existing edk2 FV engine is unchanged and remains the inspection and editing
 interoperability engine. An edk2 FV is not an EFVS checkpoint; the two containers
 have no converter.
 All serializers live in `efivar_store::efvs`; firmware and Linux compile the same
-allocation-free, dependency-free Rust source (Rust 1.82 / edition 2021 compatible).
+allocation-free, dependency-free Rust source (Rust 1.88 / edition 2024).
+The former Rust 1.82 source-embedding floor constrains no current consumer:
+firmware and host builds use Rust 1.95, and Linux uses its pinned nightly.
 `sha256` is the shared SHA-256 implementation; `auth` supplies AUTH_2 parsing.
 
 ## Identity and geometry

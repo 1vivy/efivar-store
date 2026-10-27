@@ -82,16 +82,20 @@ pub(crate) fn align(n: usize) -> Result<usize, Error> {
 }
 pub(crate) fn valid_name(name: &[u8]) -> bool {
     !name.is_empty()
-        && name.len() % 2 == 0
+        && name.len().is_multiple_of(2)
         && name.len() <= u16::MAX as usize
         && core::char::decode_utf16(
-            name.chunks_exact(2)
+            name.as_chunks::<2>()
+                .0
+                .iter()
                 .map(|b| u16::from_le_bytes([b[0], b[1]])),
         )
         .all(|c| matches!(c,Ok(c) if c!='\0'))
 }
 pub(crate) fn name_is(name: &[u8], text: &str) -> bool {
-    name.chunks_exact(2)
+    name.as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .eq(text.encode_utf16())
 }

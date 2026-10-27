@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Move the store crates to edition 2024 and Rust 1.88. The Rust 1.82
+  source-embedding floor constrained no current consumer: firmware and host
+  builds use Rust 1.95, and the Linux module uses its pinned nightly. The crates
+  now use let chains, `is_multiple_of` and `as_chunks`, so the rewrite that one
+  vendor had to carry lives here instead of in a fork. Rust 1.87 fails on the
+  new code and Rust 1.88 passes.
+
 - Linux: add `EFVS_ROOT` and an outer `EFVS_OUTPUT_DIR` that passes `MO` to
   Kbuild, so a standalone build writes the module to `out/linux`, not to the
   source tree. A consumer sets `EFVS_ROOT` and includes `linux/Kbuild` instead

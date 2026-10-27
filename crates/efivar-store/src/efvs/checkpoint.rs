@@ -44,7 +44,7 @@ impl<'a> Checkpoint<'a> {
     /// Decode and validate a checkpoint region.
     pub fn decode(bytes: &'a [u8]) -> Result<Self, Error> {
         if bytes.len() < CHECKPOINT_HEADER_SIZE
-            || bytes.len() % 8 != 0
+            || !bytes.len().is_multiple_of(8)
             || &bytes[..4] != b"EFVC"
             || u16_at(bytes, 4) != VERSION
             || u16_at(bytes, 6) != CHECKPOINT_HEADER_SIZE as u16
@@ -55,7 +55,7 @@ impl<'a> Checkpoint<'a> {
         let used = u32_at(bytes, 8) as usize;
         if used < CHECKPOINT_HEADER_SIZE
             || used > bytes.len()
-            || used % 8 != 0
+            || !used.is_multiple_of(8)
             || bytes[used..].iter().any(|b| *b != 0)
         {
             return Err(Error::Checkpoint);
@@ -150,7 +150,7 @@ impl<'a> Iterator for Variables<'a> {
 pub fn initialize_checkpoint(bytes: &mut [u8]) -> Result<(), Error> {
     if bytes.len() < CHECKPOINT_HEADER_SIZE
         || bytes.len() > u32::MAX as usize
-        || bytes.len() % 8 != 0
+        || !bytes.len().is_multiple_of(8)
     {
         return Err(Error::Bounds);
     }

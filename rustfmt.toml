@@ -1,2 +1,2 @@
-# Keep one formatting style while the kernel-compatible core uses edition 2021.
+# Keep the edition-2024 formatting style for every crate.
 style_edition = "2024"

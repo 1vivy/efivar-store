@@ -3,7 +3,7 @@ name = "efivar-store-uefi"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
+rust-version = "1.88"
 description = "UEFI variable services with a persistent block-backed store"
 
 [features]

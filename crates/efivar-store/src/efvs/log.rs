@@ -94,7 +94,7 @@ impl<'a> Record<'a> {
             return Err(Error::Record);
         }
         let n = u32_at(bytes, 4) as usize;
-        if n < RECORD_MIN_SIZE || n % 8 != 0 {
+        if n < RECORD_MIN_SIZE || !n.is_multiple_of(8) {
             return Err(Error::Record);
         }
         let b = bytes.get(..n).ok_or(Error::Bounds)?;

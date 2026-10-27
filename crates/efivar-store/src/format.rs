@@ -55,7 +55,7 @@ fn u32_at(data: &[u8], offset: usize) -> Result<u32, Error> {
 }
 
 pub(crate) fn checksum(header: &[u8]) -> u16 {
-    header.chunks_exact(2).fold(0u16, |sum, word| {
+    header.as_chunks::<2>().0.iter().fold(0u16, |sum, word| {
         sum.wrapping_add(u16::from_le_bytes([word[0], word[1]]))
     })
 }

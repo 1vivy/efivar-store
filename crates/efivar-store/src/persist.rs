@@ -169,13 +169,10 @@ pub fn apply<I: Flush>(
         if let Change::Set {
             attributes, data, ..
         } = change
+            && !data.is_empty()
+            && existing.is_some_and(|value| value.attributes == attributes && value.data == data)
         {
-            if !data.is_empty()
-                && existing
-                    .is_some_and(|value| value.attributes == attributes && value.data == data)
-            {
-                return Ok(Outcome::Unchanged);
-            }
+            return Ok(Outcome::Unchanged);
         }
         (store.layout(), records_start, append, existing.is_some())
     };

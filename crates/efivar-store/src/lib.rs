@@ -9,8 +9,8 @@
 //! byte device; the optional `std` feature adds a Unix file/block-device
 //! adapter.
 //!
-//! The dependency-free core supports Rust 1.82 and edition-2021 source embedding
-//! for Android GKI Rust modules; the host CLI uses the workspace toolchain.
+//! The dependency-free core uses edition 2024 and requires Rust 1.88.
+//! Firmware and host consumers use Rust 1.95; Linux uses its pinned nightly.
 #![no_std]
 #![deny(missing_docs)]
 
@@ -18,12 +18,10 @@
 extern crate std;
 
 pub mod auth;
-#[clippy::msrv = "1.82.0"]
 pub mod efvs;
 mod format;
 pub mod mirror;
 pub mod persist;
-#[clippy::msrv = "1.82.0"]
 pub mod sha256;
 
 use format::{ADDED, Geometry, HEADER_VALID, Record, Records, TRANSITION};
@@ -100,7 +98,9 @@ impl<'a> Name<'a> {
     /// The name's code units, in order.
     pub fn units(self) -> impl Iterator<Item = u16> + 'a {
         self.0
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|word| u16::from_le_bytes([word[0], word[1]]))
     }
 }
@@ -232,9 +232,9 @@ impl<'a> StoreMut<'a> {
         let minimum = format::FV_HEADER + format::STORE_HEADER;
         let block_size_usize = usize::try_from(block_size).map_err(|_| Error::Bounds)?;
         if image.len() < minimum
-            || image.len() % 4 != 0
+            || !image.len().is_multiple_of(4)
             || block_size == 0
-            || image.len() % block_size_usize != 0
+            || !image.len().is_multiple_of(block_size_usize)
         {
             return Err(Error::StoreSize);
         }

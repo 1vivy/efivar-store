@@ -52,7 +52,7 @@ impl Sha256 {
         self.block[56..].copy_from_slice(&bits.to_be_bytes());
         self.compress();
         let mut out = [0; 32];
-        for (chunk, word) in out.chunks_exact_mut(4).zip(self.state) {
+        for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(self.state) {
             chunk.copy_from_slice(&word.to_be_bytes());
         }
         out
@@ -71,8 +71,8 @@ impl Sha256 {
             0xc67178f2,
         ];
         let mut w = [0u32; 64];
-        for (slot, bytes) in w.iter_mut().zip(self.block.chunks_exact(4)) {
-            *slot = u32::from_be_bytes(bytes.try_into().unwrap());
+        for (slot, bytes) in w.iter_mut().zip(self.block.as_chunks::<4>().0.iter()) {
+            *slot = u32::from_be_bytes(*bytes);
         }
         for i in 16..64 {
             let x = w[i - 15];
@@ -116,7 +116,10 @@ mod tests {
     use super::*;
     fn check(input: &[u8], expected: &str) {
         let actual = digest(input);
-        for (byte, pair) in actual.iter().zip(expected.as_bytes().chunks_exact(2)) {
+        for (byte, pair) in actual
+            .iter()
+            .zip(expected.as_bytes().as_chunks::<2>().0.iter())
+        {
             let text = core::str::from_utf8(pair).unwrap();
             assert_eq!(*byte, u8::from_str_radix(text, 16).unwrap());
         }
@@ -140,7 +143,11 @@ mod tests {
             h.update(&[b'a'; 1000]);
         }
         let expected = "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0";
-        for (byte, pair) in h.finalize().iter().zip(expected.as_bytes().chunks_exact(2)) {
+        for (byte, pair) in h
+            .finalize()
+            .iter()
+            .zip(expected.as_bytes().as_chunks::<2>().0.iter())
+        {
             assert_eq!(
                 *byte,
                 u8::from_str_radix(core::str::from_utf8(pair).unwrap(), 16).unwrap()
