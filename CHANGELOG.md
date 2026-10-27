@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Linux: add `EFVS_ROOT` and an outer `EFVS_OUTPUT_DIR` that passes `MO` to
+  Kbuild, so a standalone build writes the module to `out/linux`, not to the
+  source tree. A consumer sets `EFVS_ROOT` and includes `linux/Kbuild` instead
+  of copying the rules.
 - Build: the Linux Kbuild now writes the freestanding engine archive under a
   declared directory, `EFVS_CARGO_TARGET_DIR`, which defaults to `out/linux-cargo`.
   It no longer uses the source-relative `target/` path. The root

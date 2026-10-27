@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
+EFVS_ROOT ?= $(abspath $(src)/..)
 CARGO ?= $(HOME)/.cargo/bin/cargo
 RUST_TOOLCHAIN ?= nightly-2026-08-08
 EFVS_RUSTC ?= $(dir $(CARGO))rustc
@@ -10,8 +11,8 @@ else ifneq ($(filter x86 x86_64,$(ARCH)),)
 RUST_TARGET := $(abspath $(obj)/efvs-x86_64.json)
 RUST_TARGET_DIR := efvs-x86_64
 EFVS_TARGET_DEP := $(obj)/efvs-x86_64.json
-$(obj)/efvs-x86_64.json: $(src)/rust-target.py $(objtree)/include/config/auto.conf FORCE
-	python3 $(src)/rust-target.py --rustc "$(EFVS_RUSTC)" --toolchain "$(RUST_TOOLCHAIN)" --config "$(objtree)/include/config/auto.conf" --output "$@"
+$(obj)/efvs-x86_64.json: $(EFVS_ROOT)/linux/rust-target.py $(objtree)/include/config/auto.conf FORCE
+	python3 $(EFVS_ROOT)/linux/rust-target.py --rustc "$(EFVS_RUSTC)" --toolchain "$(RUST_TOOLCHAIN)" --config "$(objtree)/include/config/auto.conf" --output "$@"
 targets += efvs-x86_64.json
 clean-files += efvs-x86_64.json
 else
@@ -46,11 +47,11 @@ endif
 EFVS_RUST_ARCHIVE := $(abspath $(EFVS_CARGO_TARGET_DIR))/$(RUST_TARGET_DIR)/release/libefivar_store_ffi.a
 obj-m := efivar_store.o
 efivar_store-objs := efivar_store_glue.o efvs_engine.o
-$(obj)/efivar_store_glue.o: $(src)/efivar_store.c FORCE
+$(obj)/efivar_store_glue.o: $(EFVS_ROOT)/linux/efivar_store.c FORCE
 	$(call if_changed_dep,cc_o_c)
 # Cargo tracks all engine sources; both ACK/DDK and standalone kbuild enter here.
-$(EFVS_RUST_ARCHIVE): $(EFVS_TARGET_DEP) $(src)/rustc-wrapper.py $(src)/compiler-builtins.rs FORCE
-	cd "$(src)/.." && RUSTC="$(EFVS_RUSTC)" RUSTC_WRAPPER="$(abspath $(src)/rustc-wrapper.py)" CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 RUSTFLAGS="$(RUST_FLAGS)" $(CARGO) +$(RUST_TOOLCHAIN) build --locked --offline --target-dir "$(abspath $(EFVS_CARGO_TARGET_DIR))" -Zjson-target-spec -Z build-std=core,compiler_builtins --release --target $(RUST_TARGET) -p efivar-store-ffi --no-default-features
+$(EFVS_RUST_ARCHIVE): $(EFVS_TARGET_DEP) $(EFVS_ROOT)/linux/rustc-wrapper.py $(EFVS_ROOT)/linux/compiler-builtins.rs FORCE
+	cd "$(EFVS_ROOT)" && RUSTC="$(EFVS_RUSTC)" RUSTC_WRAPPER="$(abspath $(EFVS_ROOT)/linux/rustc-wrapper.py)" CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 RUSTFLAGS="$(RUST_FLAGS)" $(CARGO) +$(RUST_TOOLCHAIN) build --locked --offline --target-dir "$(abspath $(EFVS_CARGO_TARGET_DIR))" -Zjson-target-spec -Z build-std=core,compiler_builtins --release --target $(RUST_TARGET) -p efivar-store-ffi --no-default-features
 quiet_cmd_efvs = LD      $@
       cmd_efvs = $(LD) -r --gc-sections $(addprefix -u ,efvs_ctx_size efvs_scratch_size efvs_load efvs_get efvs_next efvs_set efvs_query) --whole-archive $< --no-whole-archive -o $@
 $(obj)/efvs_engine.o: $(EFVS_RUST_ARCHIVE) FORCE

@@ -133,11 +133,17 @@ make -C linux KMI_SRC=/path/to/phone-common KMI_OUT=/path/to/gki-out \
   ARCH=arm64 LLVM=/usr/bin/
 ```
 
-Kbuild compiles the engine archive into `out/linux-cargo`, not into the Cargo
-host directory. `EFVS_CARGO_TARGET_DIR` declares that directory. Its default is
-`$(src)/../out/linux-cargo`, which is the repository `out/` directory, and this
-default is ignored by Git. Pass `EFVS_CARGO_TARGET_DIR` to select another
-directory. The archive path is
+The outer Makefile writes the module and generated files to `out/linux`.
+`EFVS_OUTPUT_DIR` selects another module output directory.
+It passes that directory to Kbuild as `MO`, so no build product goes into the
+source tree. `EFVS_ROOT` names the repository root of the source. A consumer
+sets `EFVS_ROOT` and includes `$(EFVS_ROOT)/linux/Kbuild` from its own Kbuild.
+The consumer supplies `MO` and `EFVS_CARGO_TARGET_DIR`. It must not copy the
+rules or the C glue.
+
+Kbuild compiles the engine archive into `out/linux-cargo`, separate from host
+Cargo output. `EFVS_CARGO_TARGET_DIR` selects another directory. The archive
+path is
 `$(EFVS_CARGO_TARGET_DIR)/<Rust target>/release/libefivar_store_ffi.a`, where
 `<Rust target>` is `aarch64-unknown-none-softfloat` or `efvs-x86_64`.
 
@@ -180,7 +186,8 @@ loader.
 The DKMS entry quotes its leading `'make'` so DKMS does not inject
 `KERNELRELEASE` into the outer wrapper. Only the recursive kernel build sets
 that variable; setting it on the wrapper selects Kbuild without its `src`
-context. `KMI_SRC=${kernel_source_dir}` selects the requested kernel rather
+context. `BUILT_MODULE_LOCATION` names `out/linux`, the directory that the outer
+Makefile passes as `MO`. `KMI_SRC=${kernel_source_dir}` selects the requested kernel rather
 than the running host. `AUTOINSTALL=no` excludes this package from DKMS autoinstall.
 
 Rust code generation uses static relocations, one codegen unit, no embedded LLVM bitcode, and no forced

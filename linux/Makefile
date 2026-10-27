@@ -10,11 +10,13 @@ ifeq ($(ARCH),aarch64)
 override ARCH := arm64
 endif
 JOBS ?= 4
+EFVS_OUTPUT_DIR ?= $(abspath $(CURDIR)/../out/linux)
 KERNEL_CONFIG := $(if $(KMI_OUT),$(KMI_OUT),$(KMI_SRC))/include/config/auto.conf
 LLVM ?= $(if $(findstring CONFIG_CC_IS_CLANG=y,$(file <$(KERNEL_CONFIG))),1,)
 .PHONY: all clean
 all:
-	$(MAKE) -C "$(KMI_SRC)" $(if $(KMI_OUT),O="$(KMI_OUT)") M="$(CURDIR)" ARCH="$(ARCH)" LLVM="$(LLVM)" KBUILD_GENDWARFKSYMS_STABLE=1 -j$(JOBS) modules
+	mkdir -p "$(EFVS_OUTPUT_DIR)"
+	$(MAKE) -C "$(KMI_SRC)" $(if $(KMI_OUT),O="$(KMI_OUT)") M="$(CURDIR)" MO="$(abspath $(EFVS_OUTPUT_DIR))" ARCH="$(ARCH)" LLVM="$(LLVM)" KBUILD_GENDWARFKSYMS_STABLE=1 -j$(JOBS) modules
 clean:
-	$(MAKE) -C "$(KMI_SRC)" $(if $(KMI_OUT),O="$(KMI_OUT)") M="$(CURDIR)" clean
+	$(MAKE) -C "$(KMI_SRC)" $(if $(KMI_OUT),O="$(KMI_OUT)") M="$(CURDIR)" MO="$(abspath $(EFVS_OUTPUT_DIR))" clean
 endif
