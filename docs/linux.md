@@ -156,7 +156,9 @@ JSON target with `linux/rust-target.py`, then pass its path to `--target`.
 
 Two toolchains stay separate. The root `rust-toolchain.toml` keeps `stable` for
 host and firmware crates. Only the Linux build selects `nightly-2026-08-08`, and
-it also needs the `rust-src` component.
+it also needs the `rust-src` component. The `kernel-ffi` CI job explicitly selects
+this nightly with `cargo +nightly-2026-08-08`, because installing it as rustup's
+default does not override the root's stable toolchain file.
 
 The Makefile works both through its outer target and direct ACK kbuild (including
 the egysk pinned-source builder). It builds the staticlib offline with pinned
