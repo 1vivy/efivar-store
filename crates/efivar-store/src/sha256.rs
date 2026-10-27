@@ -1,4 +1,5 @@
 //! Allocation-free SHA-256 (FIPS 180-4). Not a signature or MAC.
+/// A streaming SHA-256 state.
 #[derive(Clone)]
 pub struct Sha256 {
     state: [u32; 8],
@@ -12,6 +13,7 @@ impl Default for Sha256 {
     }
 }
 impl Sha256 {
+    /// A fresh state, the empty input.
     pub const fn new() -> Self {
         Self {
             state: [
@@ -23,6 +25,7 @@ impl Sha256 {
             bytes: 0,
         }
     }
+    /// Absorb `input`.
     pub fn update(&mut self, mut input: &[u8]) {
         self.bytes = self.bytes.wrapping_add(input.len() as u64);
         while !input.is_empty() {
@@ -36,6 +39,7 @@ impl Sha256 {
             }
         }
     }
+    /// Finish the hash and return its digest.
     pub fn finalize(mut self) -> [u8; 32] {
         let bits = self.bytes.wrapping_mul(8);
         self.block[self.used] = 0x80;
@@ -101,6 +105,7 @@ impl Sha256 {
         }
     }
 }
+/// The SHA-256 digest of `bytes`.
 pub fn digest(bytes: &[u8]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(bytes);

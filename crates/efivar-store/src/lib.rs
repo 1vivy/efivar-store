@@ -12,6 +12,7 @@
 //! The dependency-free core supports Rust 1.82 and edition-2021 source embedding
 //! for Android GKI Rust modules; the host CLI uses the workspace toolchain.
 #![no_std]
+#![deny(missing_docs)]
 
 #[cfg(feature = "std")]
 extern crate std;
@@ -30,29 +31,51 @@ use format::{ADDED, Geometry, HEADER_VALID, Record, Records, TRANSITION};
 /// EFI_GUID bytes in their on-disk (mixed-endian) representation, not UUID text order.
 pub type Guid = [u8; 16];
 
+/// Record-header layout of the variable store.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Layout {
+    /// edk2's plain variable record header.
     Normal,
+    /// edk2's authenticated record header, which carries `MonotonicCount`/`TimeStamp`.
     Authenticated,
 }
 
+/// Why a byte image could not be parsed or changed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
+    /// A buffer is shorter than the structure it must hold, or arithmetic on its
+    /// size overflowed.
     Bounds,
+    /// The firmware-volume header does not start with `_FVH` where the format requires it.
     FvSignature,
+    /// The firmware volume does not carry the NV-data file-system GUID this engine owns.
     FvGuid,
+    /// The firmware-volume header fields are inconsistent, for example a length that
+    /// disagrees with the image.
     FvHeader,
+    /// The firmware-volume header checksum does not match its bytes.
     FvChecksum,
+    /// The firmware-volume block map is malformed or does not describe the image.
     BlockMap,
+    /// The store header does not carry the expected store GUID or state byte.
     StoreGuid,
+    /// The declared store size disagrees with the image size or the block size.
     StoreSize,
+    /// The store header state is neither the valid erased state nor a known state.
     StoreState,
+    /// A record does not start with the record signature.
     RecordSignature,
+    /// A record's state bits are not a legal edk2 record state.
     RecordState,
+    /// A variable name is empty, not UTF-16, unterminated or too long.
     Name,
+    /// The write targets an authenticated variable, which this engine refuses to change.
     AuthenticatedWrite,
+    /// The attribute word is not a supported edk2 attribute combination.
     UnsupportedAttributes,
+    /// The append slot has no room for the record; reclaim is an explicit operation.
     Full,
+    /// The caller's reclaim scratch buffer is smaller than the live records need.
     ScratchTooSmall,
 }
 
@@ -69,10 +92,12 @@ impl core::error::Error for Error {}
 pub struct Name<'a>(&'a [u8]);
 
 impl<'a> Name<'a> {
+    /// The name's UTF-16LE wire bytes, without the terminating NUL.
     pub fn as_bytes(self) -> &'a [u8] {
         self.0
     }
 
+    /// The name's code units, in order.
     pub fn units(self) -> impl Iterator<Item = u16> + 'a {
         self.0
             .chunks_exact(2)
@@ -80,11 +105,16 @@ impl<'a> Name<'a> {
     }
 }
 
+/// One live variable record, borrowed from the image.
 #[derive(Clone, Copy, Debug)]
 pub struct Variable<'a> {
+    /// The variable name, without the terminating NUL.
     pub name: Name<'a>,
+    /// The vendor GUID in EFI on-disk byte order.
     pub guid: Guid,
+    /// The attribute word as stored; authenticated and append bits never appear.
     pub attributes: u32,
+    /// The variable value.
     pub data: &'a [u8],
 }
 
@@ -107,6 +137,7 @@ pub struct Store<'a> {
 }
 
 impl<'a> Store<'a> {
+    /// Validate the FV and store headers at byte zero and borrow the records.
     pub fn parse(image: &'a [u8]) -> Result<Self, Error> {
         Ok(Self {
             image,
@@ -114,6 +145,7 @@ impl<'a> Store<'a> {
         })
     }
 
+    /// The record-header layout this store uses.
     pub fn layout(self) -> Layout {
         self.geometry.layout
     }
@@ -188,6 +220,7 @@ pub struct StoreMut<'a> {
 }
 
 impl<'a> StoreMut<'a> {
+    /// Validate the headers of an existing image and borrow it for writing.
     pub fn parse(image: &'a mut [u8]) -> Result<Self, Error> {
         let geometry = Geometry::parse(image)?;
         Ok(Self { image, geometry })
@@ -232,6 +265,7 @@ impl<'a> StoreMut<'a> {
         Self::parse(image)
     }
 
+    /// Borrow the current image as a read-only store.
     pub fn as_store(&self) -> Store<'_> {
         Store {
             image: self.image,
@@ -239,6 +273,7 @@ impl<'a> StoreMut<'a> {
         }
     }
 
+    /// Every byte of the image, including the firmware-volume header.
     pub fn image(&self) -> &[u8] {
         self.image
     }

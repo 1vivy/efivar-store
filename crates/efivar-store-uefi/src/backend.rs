@@ -3,23 +3,33 @@ use crate::variables::{Error, MAX_NAME};
 use alloc::{vec, vec::Vec};
 use efivar_store::{efvs, persist};
 
+/// The partition geometry the consumer asks the store to adopt.
 #[derive(Clone, Copy)]
 pub struct Manifest {
+    /// Partition size in bytes.
     pub size: usize,
+    /// Capacity of each of the two checkpoint slots.
     pub checkpoint_capacity: usize,
     /// At least the device's physical write unit, not merely its logical sector.
     pub write_unit: usize,
+    /// GUID the consumer assigned to this partition.
     pub partition_guid: efvs::Guid,
 }
 
 /// Boot-time diagnostic snapshot; this exposes no mutable bytes or alternate I/O path.
 #[derive(Clone, Copy, Debug)]
 pub struct Inspection {
+    /// Header generation of the selected store.
     pub generation: u64,
+    /// Log bytes consumed by committed records.
     pub log_bytes: usize,
+    /// Log capacity of the store.
     pub log_capacity: usize,
+    /// Number of live variables.
     pub variables: usize,
+    /// Provenance posture tier the platform claims.
     pub posture_tier: u8,
+    /// Freshness-anchor value the store was opened with.
     pub anchor_value: u64,
 }
 
@@ -28,7 +38,9 @@ pub struct Inspection {
 /// [`persist::Flush`].
 pub trait Storage: persist::Flush {}
 
+/// The boot-time EFVS owner: the image, the caller's verifier and the anchor value.
 pub struct Efvs<I, V> {
+    /// The backing store, held for the whole boot-services lifetime.
     pub io: I,
     verifier: V,
     image: Vec<u8>,
@@ -120,12 +132,15 @@ impl<I: Storage, V: efvs::Verifier> Efvs<I, V> {
             config,
         })
     }
+    /// The configuration table this store publishes.
     pub fn config(&self) -> efvs::ConfigTable {
         self.config
     }
+    /// Size of the store image in bytes.
     pub fn image_size(&self) -> usize {
         self.image.len()
     }
+    /// Re-read the device and report the boot-time diagnostics.
     pub fn inspect(&mut self) -> Result<Inspection, Error> {
         self.reload()?;
         let header = efvs::Header::decode(&self.image).map_err(format_error)?;
@@ -146,6 +161,7 @@ impl<I: Storage, V: efvs::Verifier> Efvs<I, V> {
             anchor_value: self.config.anchor_value,
         })
     }
+    /// Reload the device image and replay it after a failed mutation.
     pub fn reload(&mut self) -> Result<(), Error> {
         if !self.valid {
             self.io
@@ -166,17 +182,20 @@ impl<I: Storage, V: efvs::Verifier> Efvs<I, V> {
         }
         Ok(())
     }
+    /// Iterate the replayed working set.
     pub fn variables(&self) -> Result<efvs::Variables<'_>, Error> {
         Ok(efvs::Checkpoint::decode(&self.working)
             .map_err(format_error)?
             .variables())
     }
+    /// The stored attributes and value for one key.
     pub fn get(&self, name: &[u16], guid: &efvs::Guid) -> Result<(u32, &[u8]), Error> {
         self.variables()?
             .find(|v| v.guid == *guid && units(v.name).eq(name.iter().copied()))
             .map(|v| (v.attributes, v.data))
             .ok_or(Error::NotFound)
     }
+    /// `(variable capacity, remaining capacity)` in bytes.
     pub fn capacity(&self) -> Result<(usize, usize), Error> {
         let cp = efvs::Checkpoint::decode(&self.working).map_err(format_error)?;
         let capacity = self.working.len() - efvs::CHECKPOINT_HEADER_SIZE;
@@ -289,6 +308,7 @@ impl<I: Storage, V: efvs::Verifier> Efvs<I, V> {
             .encode_checkpoint(&mut self.working)
             .map_err(format_error)
     }
+    /// Reload and confirm the key is gone.
     pub fn verify_absent(&mut self, name: &[u16], guid: &efvs::Guid) -> Result<(), Error> {
         self.valid = false;
         self.reload()?;
@@ -310,6 +330,7 @@ pub(crate) fn deleting(attributes: u32, data: &[u8]) -> Result<bool, Error> {
     };
     Ok(attributes == 0 || (value.is_empty() && attributes & efvs::ATTR_APPEND == 0))
 }
+/// Decode UTF-16LE wire bytes into code units.
 pub fn units(bytes: &[u8]) -> impl Iterator<Item = u16> + '_ {
     bytes
         .as_chunks::<2>()

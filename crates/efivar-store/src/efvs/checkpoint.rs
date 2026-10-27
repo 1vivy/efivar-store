@@ -1,13 +1,21 @@
 use super::super::sha256::Sha256;
 use super::*;
+/// Bytes of the encoded checkpoint header.
 pub const CHECKPOINT_HEADER_SIZE: usize = 96;
+/// Bytes of one encoded checkpoint variable header.
 pub const VARIABLE_HEADER_SIZE: usize = 48;
+/// One variable inside a checkpoint.
 #[derive(Clone, Copy, Debug)]
 pub struct Variable<'a> {
+    /// The name in UTF-16LE wire bytes, without the terminating NUL.
     pub name: &'a [u8],
+    /// The vendor GUID in EFI on-disk byte order.
     pub guid: Guid,
+    /// The stored attribute word.
     pub attributes: u32,
+    /// The stored authentication time stamp, or zeroes when there is none.
     pub timestamp: Timestamp,
+    /// The stored value.
     pub data: &'a [u8],
 }
 fn checkpoint_hash(bytes: &[u8]) -> [u8; 32] {
@@ -17,16 +25,23 @@ fn checkpoint_hash(bytes: &[u8]) -> [u8; 32] {
     h.update(&bytes[64..]);
     h.finalize()
 }
+/// A decoded checkpoint: its variables and the state its header records.
 #[derive(Clone, Copy)]
 pub struct Checkpoint<'a> {
     bytes: &'a [u8],
+    /// Bytes of the checkpoint in use, header included.
     pub used: usize,
+    /// Number of variables the checkpoint holds.
     pub count: u32,
+    /// Sequence number the next log record must carry.
     pub next_sequence: u64,
+    /// Number of authenticated writes this checkpoint accounts for.
     pub authenticated_count: u64,
+    /// The checkpoint's SHA-256 over its own bytes.
     pub hash: [u8; 32],
 }
 impl<'a> Checkpoint<'a> {
+    /// Decode and validate a checkpoint region.
     pub fn decode(bytes: &'a [u8]) -> Result<Self, Error> {
         if bytes.len() < CHECKPOINT_HEADER_SIZE
             || bytes.len() % 8 != 0
@@ -77,6 +92,7 @@ impl<'a> Checkpoint<'a> {
         }
         Ok(cp)
     }
+    /// Iterate the checkpoint's variables in stored order.
     pub fn variables(self) -> Variables<'a> {
         Variables {
             bytes: &self.bytes[CHECKPOINT_HEADER_SIZE..self.used],
@@ -115,6 +131,7 @@ fn decode_variable(bytes: &[u8]) -> Result<(Variable<'_>, usize), Error> {
         n,
     ))
 }
+/// Iterator over a checkpoint's encoded variables.
 pub struct Variables<'a> {
     bytes: &'a [u8],
 }
@@ -129,6 +146,7 @@ impl<'a> Iterator for Variables<'a> {
         Some(v)
     }
 }
+/// Write an empty checkpoint header with its hash into `bytes`.
 pub fn initialize_checkpoint(bytes: &mut [u8]) -> Result<(), Error> {
     if bytes.len() < CHECKPOINT_HEADER_SIZE
         || bytes.len() > u32::MAX as usize
@@ -149,10 +167,13 @@ pub fn initialize_checkpoint(bytes: &mut [u8]) -> Result<(), Error> {
 pub struct State<'a> {
     pub(crate) bytes: &'a mut [u8],
     pub(crate) used: usize,
+    /// Sequence number the next log record must carry.
     pub next_sequence: u64,
+    /// Number of authenticated writes accepted so far.
     pub authenticated_count: u64,
 }
 impl<'a> State<'a> {
+    /// Load a checkpoint into caller-owned scratch as the mutable working set.
     pub fn from_checkpoint(checkpoint: &[u8], scratch: &'a mut [u8]) -> Result<Self, Error> {
         let cp = Checkpoint::decode(checkpoint)?;
         if scratch.len() < checkpoint.len() {
@@ -167,6 +188,7 @@ impl<'a> State<'a> {
             authenticated_count: cp.authenticated_count,
         })
     }
+    /// An empty working set over `scratch`.
     pub fn empty(scratch: &'a mut [u8]) -> Result<Self, Error> {
         initialize_checkpoint(scratch)?;
         Ok(Self {
@@ -176,17 +198,21 @@ impl<'a> State<'a> {
             authenticated_count: 0,
         })
     }
+    /// Iterate the working set's variables.
     pub fn variables(&self) -> Variables<'_> {
         Variables {
             bytes: &self.bytes[CHECKPOINT_HEADER_SIZE..self.used],
         }
     }
+    /// The live value for one key, when the working set holds it.
     pub fn get(&self, name: &[u8], guid: &Guid) -> Option<Variable<'_>> {
         self.variables().find(|v| v.name == name && v.guid == *guid)
     }
+    /// Variable bytes the working set can hold, header excluded.
     pub fn capacity(&self) -> usize {
         self.bytes.len() - CHECKPOINT_HEADER_SIZE
     }
+    /// Variable bytes in use, header excluded.
     pub fn used(&self) -> usize {
         self.used - CHECKPOINT_HEADER_SIZE
     }
@@ -270,6 +296,7 @@ impl<'a> State<'a> {
         self.bytes[self.used..].fill(0);
         Ok(())
     }
+    /// Encode the working set as a checkpoint into `dst` and hash it.
     pub fn encode_checkpoint(&self, dst: &mut [u8]) -> Result<(), Error> {
         if dst.len() != self.bytes.len() {
             return Err(Error::Bounds);
@@ -313,14 +340,20 @@ pub fn compact(image: &mut [u8], state: &State<'_>) -> Result<u64, Error> {
 /// Header blocks occupy distinct physical write units: callers must use geometry
 /// whose block_size is at least their device's actual physical write unit.
 pub trait CompactionIo {
+    /// The sink's I/O error type.
     type Error;
+    /// Program `bytes` at `offset`.
     fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), Self::Error>;
+    /// Make every preceding write durable.
     fn flush(&mut self) -> Result<(), Self::Error>;
 }
 
+/// Why a durable compaction did not complete.
 #[derive(Debug)]
 pub enum CompactionError<E> {
+    /// The image or the working set failed format validation.
     Format(Error),
+    /// The sink failed a write or a flush.
     Io(E),
 }
 impl<E: core::fmt::Display> core::fmt::Display for CompactionError<E> {

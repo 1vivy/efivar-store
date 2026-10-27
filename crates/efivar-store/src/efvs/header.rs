@@ -1,25 +1,39 @@
 use super::*;
+/// Bytes of one encoded EFVS header.
 pub const HEADER_SIZE: usize = 64;
+/// The block size used when the caller does not select one.
 pub const DEFAULT_BLOCK_SIZE: usize = 4096;
+/// The smallest header block the format accepts.
 pub const MIN_BLOCK_SIZE: usize = 512;
+/// The largest header block the format accepts.
 pub const MAX_BLOCK_SIZE: usize = 65536;
+/// One decoded EFVS header: the geometry and generation of a store image.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Header {
+    /// Total image size in bytes.
     pub image_size: usize,
+    /// Start of the selected checkpoint slot.
     pub checkpoint_offset: usize,
     /// Capacity of each of the two checkpoint slots.
     pub checkpoint_capacity: usize,
+    /// Start of the log area.
     pub log_offset: usize,
+    /// Bytes of log area available.
     pub log_capacity: usize,
+    /// Size of one header block; the physical write unit floor.
     pub block_size: usize,
     /// Header A is at zero; header B is at block_size.
     pub header_offset: usize,
+    /// Monotonic generation; the highest valid generation wins.
     pub generation: u64,
 }
 impl Header {
+    /// Geometry for `image_size` with the default block size.
     pub fn new(image_size: usize, checkpoint_capacity: usize) -> Result<Self, Error> {
         Self::new_with_block(image_size, checkpoint_capacity, DEFAULT_BLOCK_SIZE)
     }
+
+    /// Geometry for `image_size` and an explicit block size.
     pub fn new_with_block(
         image_size: usize,
         checkpoint_capacity: usize,
@@ -75,9 +89,11 @@ impl Header {
         }
         Ok(())
     }
+    /// Byte range of the selected checkpoint slot.
     pub fn checkpoint_range(self) -> core::ops::Range<usize> {
         self.checkpoint_offset..self.checkpoint_offset + self.checkpoint_capacity
     }
+    /// Byte range of this header's physical block.
     pub fn header_range(self) -> core::ops::Range<usize> {
         self.header_offset..self.header_offset + self.block_size
     }
@@ -176,6 +192,7 @@ impl Header {
         Ok(())
     }
 }
+/// CRC-32 (IEEE 802.3, reflected, no table).
 pub fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
     for b in bytes {
@@ -186,9 +203,11 @@ pub fn crc32(bytes: &[u8]) -> u32 {
     }
     !crc
 }
+/// Initialise a blank image with both headers and both checkpoints.
 pub fn initialize(image: &mut [u8], checkpoint_capacity: usize) -> Result<(), Error> {
     initialize_with_block(image, checkpoint_capacity, DEFAULT_BLOCK_SIZE)
 }
+/// [`initialize`] with an explicit block size.
 pub fn initialize_with_block(
     image: &mut [u8],
     checkpoint_capacity: usize,

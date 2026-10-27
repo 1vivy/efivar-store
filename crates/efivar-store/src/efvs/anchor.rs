@@ -1,13 +1,21 @@
 use super::Error;
+/// The anchor exposes no capability: it is boot-local state only.
 pub const CAP_NONE: u32 = 0;
+/// The anchor can report a value that survives power loss.
 pub const CAP_MONOTONIC: u32 = 1;
+/// The runtime can bump the anchor without boot services.
 pub const CAP_RUNTIME_BUMP: u32 = 2;
+/// Offset of the EFVS freshness anchor in the Qualcomm DeviceInfo record.
 pub const DEVINFO_RB_EFVS_ANCHOR: u32 = 31;
 /// Implementations, not callers, must enforce new_value > current and boot lock.
 pub trait AnchorOps {
+    /// Read the current protected value.
     fn read(&mut self) -> Result<u64, Error>;
+    /// Raise the protected value to `new_value`.
     fn bump(&mut self, new_value: u64) -> Result<(), Error>;
+    /// Refuse every later bump until the next boot.
     fn lock(&mut self) -> Result<(), Error>;
+    /// Report the anchor's capabilities as `CAP_*` bits.
     fn capabilities(&self) -> u32;
 }
 /// Real no-persistence backend. Its boot-local value is NOT rollback protection.
@@ -17,6 +25,7 @@ pub struct NoneAnchor {
     locked: bool,
 }
 impl NoneAnchor {
+    /// A boot-local anchor at value zero, unlocked.
     pub const fn new() -> Self {
         Self {
             value: 0,

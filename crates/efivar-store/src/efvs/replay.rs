@@ -1,11 +1,14 @@
 use super::super::auth::{self, Authentication2, Time};
 use super::*;
+/// `EFI_GLOBAL_VARIABLE`: the vendor GUID of `PK`, `KEK` and the mode variables.
 pub const GLOBAL_GUID: Guid = [
     0x61, 0xdf, 0xe4, 0x8b, 0xca, 0x93, 0xd2, 0x11, 0xaa, 0x0d, 0x00, 0xe0, 0x98, 0x03, 0x2b, 0x8c,
 ];
+/// `EFI_IMAGE_SECURITY_DATABASE_GUID`: the vendor GUID of `db`, `dbx`, `dbt` and `dbr`.
 pub const IMAGE_SECURITY_GUID: Guid = [
     0xcb, 0xb2, 0x19, 0xd7, 0x3a, 0x3d, 0x96, 0x45, 0xa3, 0xbc, 0xda, 0xd0, 0x0e, 0x67, 0x65, 0x6f,
 ];
+/// The shim's vendor GUID that carries `MokList` and its neighbours.
 pub const SHIM_GUID: Guid = [
     0x50, 0xab, 0x5d, 0x60, 0x46, 0xe0, 0x00, 0x43, 0xab, 0xb6, 0x3d, 0xd8, 0x10, 0xdd, 0x8b, 0x23,
 ];
@@ -23,6 +26,7 @@ pub fn boot_services_only(name: &[u8], guid: &Guid) -> bool {
         .iter()
         .any(|s| name_is(name, s))
 }
+/// Whether `(name, guid)` is a secure-boot key database the policy protects.
 pub fn secure_boot_key(name: &[u8], guid: &Guid) -> bool {
     (*guid == GLOBAL_GUID && ["PK", "KEK"].iter().any(|s| name_is(name, s)))
         || (*guid == IMAGE_SECURITY_GUID
@@ -31,7 +35,10 @@ pub fn secure_boot_key(name: &[u8], guid: &Guid) -> bool {
 /// Signature hook. The current working set includes earlier accepted key updates.
 /// No production cryptographic verifier is supplied by this crate.
 pub trait Verifier {
+    /// The rules that do not need a signature: may this `(name, guid, attributes)`
+    /// be written at all.
     fn authorize(&self, name: &[u8], guid: &Guid, attributes: u32) -> Result<(), Error>;
+    /// Check the signature a time-based authenticated request carries.
     fn verify(
         &mut self,
         request: RecordInput<'_>,
@@ -166,14 +173,23 @@ impl State<'_> {
         Ok(())
     }
 }
+/// The outcome of replaying a store: the working set and the log scan counters.
 pub struct Replay<'a> {
+    /// The replayed working set; compact it to make it durable.
     pub state: State<'a>,
+    /// Records accepted from the log.
     pub accepted: u64,
+    /// Records rejected by the verifier or by a rule.
     pub rejected: u64,
+    /// Authenticated writes the log accounts for.
     pub authenticated_writes: u64,
+    /// Log bytes consumed by valid records.
     pub log_bytes: usize,
+    /// How the log scan terminated.
     pub end: LogEnd,
 }
+/// Replay the checkpoint and log under `verifier` and refuse a store whose
+/// authenticated counter is below `anchor`.
 pub fn replay<'a>(
     image: &[u8],
     scratch: &'a mut [u8],

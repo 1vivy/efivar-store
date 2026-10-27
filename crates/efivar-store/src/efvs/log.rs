@@ -1,23 +1,36 @@
 use super::super::sha256::digest;
 use super::*;
+/// Bytes of one encoded log-record header.
 pub const RECORD_HEADER_SIZE: usize = 76;
+/// Smallest record the format accepts, header and hash included.
 pub const RECORD_MIN_SIZE: usize = 112;
+/// The operation a log record performs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
 pub enum Operation {
+    /// Replace the value.
     Set = 1,
+    /// Append to the stored value.
     Append = 2,
+    /// Delete the variable.
     Delete = 3,
 }
+/// One requested log record, before encoding.
 #[derive(Clone, Copy, Debug)]
 pub struct RecordInput<'a> {
+    /// The variable name in UTF-16LE wire bytes, without the terminating NUL.
     pub name: &'a [u8],
+    /// The vendor GUID in EFI on-disk byte order.
     pub guid: Guid,
+    /// The submitted attribute word.
     pub attributes: u32,
+    /// The operation this record performs.
     pub operation: Operation,
+    /// The submitted value.
     pub data: &'a [u8],
 }
 impl RecordInput<'_> {
+    /// Encoded length of this record, including its hash and padding.
     pub fn encoded_len(self) -> Result<usize, Error> {
         if !valid_name(self.name) || self.data.len() > u32::MAX as usize {
             return Err(Error::Name);
@@ -33,15 +46,22 @@ impl RecordInput<'_> {
         Ok(length)
     }
 }
+/// One decoded log record.
 #[derive(Clone, Copy, Debug)]
 pub struct Record<'a> {
+    /// The requested change.
     pub input: RecordInput<'a>,
+    /// The record's sequence number.
     pub sequence: u64,
+    /// The hash of the preceding record or checkpoint.
     pub previous_hash: [u8; 32],
+    /// The hash this record carries.
     pub hash: [u8; 32],
+    /// Encoded length of the record in bytes.
     pub length: usize,
 }
 impl<'a> Record<'a> {
+    /// Encode one record into `dst`, returning its length.
     pub fn encode(
         dst: &mut [u8],
         input: RecordInput<'_>,
@@ -68,6 +88,7 @@ impl<'a> Record<'a> {
         b[n - 32..].copy_from_slice(&hash);
         Ok(n)
     }
+    /// Decode one record from the start of `bytes`.
     pub fn decode(bytes: &'a [u8]) -> Result<Self, Error> {
         if bytes.len() < RECORD_MIN_SIZE || &bytes[..4] != b"EFVR" {
             return Err(Error::Record);
@@ -115,20 +136,29 @@ impl<'a> Record<'a> {
         })
     }
 }
+/// How the log scan terminated.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogEnd {
+    /// The log ended in erased bytes: a clean end of the committed records.
     Clean,
+    /// The next bytes are not a valid record: a torn or corrupt append.
     Torn,
 }
+/// A forward scan over the committed log records.
 pub struct Log<'a> {
     bytes: &'a [u8],
+    /// Bytes consumed by valid records so far.
     pub consumed: usize,
+    /// Sequence number the next record must carry.
     pub next_sequence: u64,
+    /// Hash the next record must chain to.
     pub previous_hash: [u8; 32],
+    /// How the last scan terminated.
     pub end: LogEnd,
     stopped: bool,
 }
 impl<'a> Log<'a> {
+    /// Start scanning `bytes` from the checkpoint's hash and sequence number.
     pub fn new(bytes: &'a [u8], checkpoint_hash: [u8; 32], next_sequence: u64) -> Self {
         Self {
             bytes,

@@ -10,52 +10,85 @@ pub mod index;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub mod runtime;
 
+/// `EFI_VARIABLE_NON_VOLATILE`.
 pub const NV: u32 = 1;
+/// `EFI_VARIABLE_BOOTSERVICE_ACCESS`.
 pub const BS: u32 = 2;
+/// `EFI_VARIABLE_RUNTIME_ACCESS`.
 pub const RT: u32 = 4;
+/// Longest accepted variable name, in code units, terminator included.
 pub const MAX_NAME: usize = 256;
+/// Largest accepted variable value in bytes.
 pub const MAX_VALUE: usize = 64 * 1024;
+/// Bytes the volatile overlay may hold.
 pub const OVERLAY_BYTES: usize = 64 * 1024;
+/// Most variables the managed store and the snapshot index accept together.
 pub const MAX_VARIABLES: usize = 512;
 
+/// Why a variable operation failed, in the shape a UEFI status maps from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
+    /// The name, attribute word or request is inconsistent.
     InvalidParameter,
+    /// The feature or route is not offered by this configuration.
     Unsupported,
+    /// The variable does not exist.
     NotFound,
+    /// The verifier refused the write.
     SecurityViolation,
+    /// The variable is firmware-only or otherwise write-protected.
     WriteProtected,
+    /// The caller's output buffer is smaller than the value.
     BufferTooSmall(usize),
+    /// The store or overlay has no room.
     OutOfResources,
+    /// The backing device failed an operation or returned unexpected bytes.
     Device,
+    /// The stored bytes do not parse.
     Corrupt,
 }
 
+/// One variable value, owned.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Variable {
+    /// The name, in UTF-16 code units without the terminator.
     pub name: Vec<u16>,
+    /// The vendor GUID in EFI on-disk byte order.
     pub guid: Guid,
+    /// The attribute word.
     pub attributes: u32,
+    /// The value.
     pub data: Vec<u8>,
 }
 
+/// One `(name, GUID)` key, owned.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Key {
+    /// The name, in UTF-16 code units without the terminator.
     pub name: Vec<u16>,
+    /// The vendor GUID in EFI on-disk byte order.
     pub guid: Guid,
 }
 
 /// Caller-owned namespace decision; evaluated only before ExitBootServices.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Route {
+    /// Serve the GUID from the firmware's own variable services.
     Firmware,
-    Store { volatile: bool },
+    /// Serve the GUID from the managed store; `volatile` keeps the value in
+    /// the boot-local overlay instead of the partition.
+    Store {
+        /// Keep the value in the boot-local overlay only.
+        volatile: bool,
+    },
 }
+/// The consumer's `GUID -> Route` decision function.
 pub type Policy = fn(&Guid) -> Route;
 fn managed(policy: Policy, guid: &Guid) -> bool {
     matches!(policy(guid), Route::Store { .. })
 }
 
+/// Whether `name` is a legal UEFI variable name.
 pub fn valid_name(name: &[u16]) -> bool {
     !name.is_empty()
         && name.len() < MAX_NAME
@@ -63,6 +96,7 @@ pub fn valid_name(name: &[u16]) -> bool {
         && char::decode_utf16(name.iter().copied()).all(|c| c.is_ok())
 }
 
+/// Check an attribute word the volatile overlay accepts.
 pub fn validate_attributes(attributes: u32) -> Result<(), Error> {
     if attributes & !7 != 0 {
         return Err(Error::Unsupported);
@@ -75,28 +109,41 @@ pub fn validate_attributes(attributes: u32) -> Result<(), Error> {
 
 /// Firmware adapter supplies owned values only in boot-services context.
 pub trait Firmware {
+    /// Read one firmware-owned variable.
     fn get(&mut self, name: &[u16], guid: &Guid) -> Result<Variable, Error>;
+    /// Write one firmware-owned variable.
     fn set(&mut self, name: &[u16], guid: &Guid, attributes: u32, data: &[u8])
     -> Result<(), Error>;
+    /// List the firmware-owned variables whose GUIDs the policy keeps on firmware.
     fn list(&mut self) -> Result<Vec<Variable>, Error>;
+    /// Enumerate keys without copying values, when the firmware can.
     fn enumerate(&mut self) -> Result<Vec<Variable>, Error> {
         self.list()
     }
+    /// Whether `list` stopped short of the full namespace.
     fn truncated(&self) -> bool {
         false
     }
 }
 
+/// The routed variable service: a managed store, the firmware adapter, and the
+/// boot-local volatile overlay.
 pub struct Service<I, F, V = efvs::PolicyNone> {
+    /// The managed persistent store.
     pub store: Efvs<I, V>,
+    /// The GUID routing decision.
     pub policy: Policy,
+    /// The firmware namespace the policy keeps on firmware.
     pub firmware: F,
     overlay: Vec<Variable>,
     captured: Vec<Variable>,
+    /// Whether capturing firmware runtime variables overflowed a limit.
     pub capture_truncated: bool,
 }
 
 impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
+    /// Open the managed store and capture the firmware runtime variables the
+    /// policy keeps on firmware.
     pub fn open(
         io: I,
         mut firmware: F,
@@ -137,6 +184,7 @@ impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
         })
     }
 
+    /// Size of the managed store image in bytes.
     pub fn image_size(&self) -> usize {
         self.store.image_size()
     }
@@ -145,6 +193,7 @@ impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
         self.store.reload()
     }
 
+    /// Read one variable through the route its GUID selects.
     pub fn get(&mut self, name: &[u16], guid: &Guid) -> Result<Variable, Error> {
         if !managed(self.policy, guid) {
             return self.firmware.get(name, guid);
@@ -178,6 +227,7 @@ impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
         self.store.get(name, guid)
     }
 
+    /// Write one variable through the route its GUID selects.
     pub fn set(
         &mut self,
         name: &[u16],
@@ -276,6 +326,7 @@ impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
         self.store.set(name, guid, attributes, data)
     }
 
+    /// Refresh the captured firmware copy of one key after a firmware write.
     pub fn refresh_capture(&mut self, name: &[u16], guid: &Guid) {
         self.captured.retain(|v| v.guid != *guid || v.name != name);
         match self.firmware.get(name, guid) {
@@ -317,6 +368,7 @@ impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
     }
 
     /// Managed keys first, then non-managed firmware keys; neither phase copies values.
+    /// Both phases are ordered by GUID then name.
     pub fn list(&mut self) -> Result<Vec<Key>, Error> {
         self.reload()?;
         let mut values: Vec<_> = self
@@ -349,6 +401,7 @@ impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
         Ok(values)
     }
 
+    /// Build the immutable physical-runtime index into `output`.
     pub fn snapshot(&mut self, output: &mut [u8]) -> Result<(), Error> {
         self.reload()?;
         let (maximum, remaining) = self.store.capacity()?;
@@ -397,6 +450,8 @@ impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
         Ok(())
     }
 
+    /// `QueryVariableInfo` values for one attribute class: maximum, remaining, and
+    /// largest single value.
     pub fn capacity(&mut self, attributes: u32) -> Result<(u64, u64, u64), Error> {
         validate_attributes(attributes)?;
         self.reload()?;
@@ -417,6 +472,7 @@ impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
     }
 }
 
+/// The key after `(previous, guid)` in a sorted key list.
 pub fn next<'a>(values: &'a [Key], previous: &[u16], guid: &Guid) -> Result<&'a Key, Error> {
     let position = if previous.is_empty() {
         0
@@ -430,6 +486,7 @@ pub fn next<'a>(values: &'a [Key], previous: &[u16], guid: &Guid) -> Result<&'a 
     values.get(position).ok_or(Error::NotFound)
 }
 
+/// Copy a variable value into `output`, returning its attributes and length.
 pub fn read_value(value: &Variable, output: &mut [u8]) -> Result<(u32, usize), Error> {
     if output.len() < value.data.len() {
         return Err(Error::BufferTooSmall(value.data.len()));

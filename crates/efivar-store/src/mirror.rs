@@ -2,11 +2,16 @@
 //! spare is also valid: the spare is a previous pre-boot snapshot, not a journal.
 use super::Store;
 
+/// What an offline primary/spare comparison requires.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Decision {
+    /// Both copies are valid and identical.
     Unchanged,
+    /// The primary is valid and differs: copy it over the spare.
     Mirror,
+    /// The primary is invalid and the spare is valid: copy the spare back.
     Restore,
+    /// Neither copy is a valid store at this size.
     Invalid,
 }
 

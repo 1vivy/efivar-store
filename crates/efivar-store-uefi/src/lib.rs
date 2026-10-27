@@ -1,6 +1,7 @@
 //! UEFI variable-service library linked into a boot application.
 //! Boot-time construction uses `alloc`; copied runtime readers do not.
 #![no_std]
+#![deny(missing_docs)]
 extern crate alloc;
 #[cfg(test)]
 extern crate std;

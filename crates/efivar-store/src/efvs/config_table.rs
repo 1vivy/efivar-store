@@ -7,12 +7,18 @@ pub const CONFIG_TABLE_GUID: Guid = [
 pub const PARTITION_TYPE_GUID: Guid = [
     0xb2, 0x63, 0x76, 0x51, 0xb3, 0x3f, 0x78, 0x4a, 0x9a, 0xbe, 0xc4, 0x55, 0x94, 0x84, 0x8d, 0xd5,
 ];
+/// Bytes of one encoded EFVS configuration table.
 pub const CONFIG_TABLE_SIZE: usize = 48;
+/// The EFVS configuration table published in `EFI_CONFIGURATION_TABLE`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConfigTable {
+    /// GUID of the EFVS partition this table describes.
     pub partition_guid: Guid,
+    /// Provenance posture tier the platform can claim.
     pub posture_tier: u8,
+    /// Freshness-anchor value the store was opened with.
     pub anchor_value: u64,
+    /// Anchor capabilities the platform declares.
     pub capabilities: u32,
 }
 impl ConfigTable {
@@ -25,6 +31,7 @@ impl ConfigTable {
         }
         Ok(())
     }
+    /// Encode the table into `dst`.
     pub fn encode(self, dst: &mut [u8]) -> Result<(), Error> {
         self.validate()?;
         let b = dst.get_mut(..CONFIG_TABLE_SIZE).ok_or(Error::Bounds)?;
@@ -38,6 +45,7 @@ impl ConfigTable {
         b[32..40].copy_from_slice(&self.anchor_value.to_le_bytes());
         Ok(())
     }
+    /// Decode and validate a configuration table.
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let b = bytes.get(..CONFIG_TABLE_SIZE).ok_or(Error::Bounds)?;
         if &b[..4] != b"EFVT"

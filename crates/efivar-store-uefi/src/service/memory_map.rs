@@ -18,6 +18,7 @@ pub struct MemoryMap {
 }
 
 impl MemoryMap {
+    /// Capture the live firmware memory map into an owned copy.
     pub fn capture(boot: &efi::BootServices) -> Result<Self, Status> {
         let mut size = 0_usize;
         let mut key = 0_usize;

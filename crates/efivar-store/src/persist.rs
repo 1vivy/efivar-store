@@ -50,13 +50,22 @@ pub enum Change<'a> {
     /// Replace the value. An empty `data` is an EFI delete, exactly like
     /// [`Change::Delete`]; the `attributes` are still validated.
     Set {
+        /// The variable name, in UTF-16 code units without the terminator.
         name: &'a [u16],
+        /// The vendor GUID in EFI on-disk byte order.
         guid: &'a Guid,
+        /// The submitted attribute word.
         attributes: u32,
+        /// The new value; empty means delete.
         data: &'a [u8],
     },
     /// Delete every live version of the key.
-    Delete { name: &'a [u16], guid: &'a Guid },
+    Delete {
+        /// The variable name, in UTF-16 code units without the terminator.
+        name: &'a [u16],
+        /// The vendor GUID in EFI on-disk byte order.
+        guid: &'a Guid,
+    },
 }
 
 /// Observable result of [`apply`].
@@ -80,12 +89,21 @@ pub enum Error<E> {
     /// The backing store failed a read, write or flush.
     Io(E),
     /// The device did not return the byte the commit programmed.
-    Readback { offset: usize },
+    Readback {
+        /// Byte offset the device did not reproduce.
+        offset: usize,
+    },
     /// The append slot already holds non-erased bytes.
-    NotErased { offset: usize },
+    NotErased {
+        /// Byte offset of the first non-erased append byte.
+        offset: usize,
+    },
     /// A pre-append byte changed in a way that is not a legal record-state
     /// transition, so the planned commit is not an edk2 update.
-    Unexpected { offset: usize },
+    Unexpected {
+        /// Byte offset of the illegal change.
+        offset: usize,
+    },
 }
 
 impl<E: core::fmt::Display> core::fmt::Display for Error<E> {

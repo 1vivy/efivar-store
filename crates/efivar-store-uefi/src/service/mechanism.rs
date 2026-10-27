@@ -55,17 +55,32 @@ static PUBLISHED_CONTEXT: AtomicPtr<EventContext> = AtomicPtr::new(ptr::null_mut
 /// The four position-independent callbacks and the linker-delimited blob that
 /// carries them and their constants, as delimited by the proof's assembly.
 pub enum Report {
+    /// The copied callbacks passed the proof's pre-publication self-test.
     SelfTest,
-    Armed { code: u64, table: u64 },
+    /// The private runtime table and callbacks are published and armed.
+    Armed {
+        /// Physical start of the copied runtime code.
+        code: u64,
+        /// Physical start of the private runtime table.
+        table: u64,
+    },
 }
 
+/// Where the proof's runtime callbacks live inside its linked blob.
 pub struct CallbackBlob {
+    /// First byte of the blob.
     pub start: usize,
+    /// Size of the blob in bytes.
     pub size: usize,
+    /// Address of the `GetVariable` entry.
     pub get_variable: usize,
+    /// Address of the `GetNextVariableName` entry.
     pub get_next_variable_name: usize,
+    /// Address of the `SetVariable` entry.
     pub set_variable: usize,
+    /// Address of the `QueryVariableInfo` entry.
     pub query_variable_info: usize,
+    /// Offset of the index-pointer slot and the address to write into it.
     pub index: Option<(usize, usize)>,
 }
 
@@ -73,6 +88,7 @@ pub struct CallbackBlob {
 pub struct ProofWiring {
     /// Entry installed in `BootServices.ExitBootServices` before publication.
     pub report: fn(Report),
+    /// Optional `ExitBootServices` interposer the proof installs for itself.
     pub interposer: Option<efi::BootExitBootServices>,
     /// Verifies the copied callbacks before the private table is published.
     pub self_test: fn(
@@ -87,12 +103,17 @@ pub struct ProofWiring {
     pub mark: fn(u64, u64) -> bool,
 }
 
+/// The state one published runtime-table override hands to its notifications.
 #[repr(C)]
 pub struct EventContext {
+    /// Live boot services, captured only for the `lab` diagnostics.
     #[cfg(feature = "lab")]
     pub boot: NonNull<efi::BootServices>,
+    /// The private runtime table the callbacks were installed into.
     pub runtime: NonNull<efi::RuntimeServices>,
+    /// Firmware's own `ExitBootServices`, restored on rollback.
     pub original_exit_boot_services: efi::BootExitBootServices,
+    /// Firmware's CRC-32 implementation, for header maintenance.
     pub calculate_crc32: efi::BootCalculateCrc32,
     get_variable: efi::RuntimeGetVariable,
     get_next_variable_name: efi::RuntimeGetNextVariableName,
@@ -102,10 +123,12 @@ pub struct EventContext {
     interposer: Option<efi::BootExitBootServices>,
     snapshot: fn() -> bool,
     mark: fn(u64, u64) -> bool,
+    /// The lab shadow's memory-map trace.
     #[cfg(feature = "lab")]
     pub map: Vec<u64>,
 }
 
+/// One installed private-runtime-table override, restorable before `ExitBootServices`.
 pub struct Override {
     table: NonNull<efi::SystemTable>,
     original_services: NonNull<efi::BootServices>,
@@ -480,6 +503,8 @@ impl Override {
         (self.code_address, self.code_pages)
     }
 
+    /// Undo the publication: swap back the original table, close the event and
+    /// release the copied code and private table.
     pub fn restore(&mut self) -> Result<(), Status> {
         if !self.armed {
             return Ok(());

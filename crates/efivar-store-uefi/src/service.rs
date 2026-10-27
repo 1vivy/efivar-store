@@ -81,6 +81,11 @@ impl Context {
     }
 }
 
+/// The installed EFVS-backed variable service.
+///
+/// Owns the private runtime table, the copied runtime code, the physical index
+/// and the runtime services this installation replaced. Restore it before
+/// successful `ExitBootServices`; after that, the object leaks into runtime.
 pub struct VariableService {
     table: NonNull<efi::SystemTable>,
     original: NonNull<efi::RuntimeServices>,
@@ -232,10 +237,12 @@ impl VariableService {
         )?;
         Ok(value)
     }
+    /// The firmware runtime services this installation replaced.
     pub fn original_runtime(&self) -> &'static efi::RuntimeServices {
         // SAFETY: saved firmware table remains firmware-owned throughout runtime.
         unsafe { self.original.as_ref() }
     }
+    /// Undo the installation while boot services are still live.
     pub fn restore(mut self) -> Result<(), Status> {
         self.cleanup()
     }
@@ -300,6 +307,7 @@ fn context() -> Result<(&'static mut Context, Guard), Status> {
     Ok((unsafe { context.as_mut() }, guard))
 }
 
+/// Whether a variable service is currently installed.
 pub fn installed() -> bool {
     !CONTEXT.load(Ordering::Acquire).is_null()
 }
