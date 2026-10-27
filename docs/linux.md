@@ -108,6 +108,20 @@ ACK's boot-only parser discards unknown GUIDs and releases the table arrays. It
 would need a recognized GUID entry in `efi_config_parse_tables` and retained
 decoded descriptor, not scanning reclaimable boot memory from an external LKM.
 
+## Host build
+
+The root `rust-toolchain.toml` selects `stable` for the host crates: the storage
+engine, the UEFI service, the FFI crate and the CLI. Cargo writes host output to
+the ignored `target/` directory. Set `CARGO_TARGET_DIR` to place it elsewhere.
+
+```sh
+cargo build --locked
+cargo build --locked --release -p efivar-store-cli
+```
+
+The UEFI crate is a `no_std` library. The host build also compiles it, and no
+separate toolchain is needed for it.
+
 ## Freestanding build
 
 A fully built matching ACK output is required: generated C headers,
@@ -117,6 +131,32 @@ Module.symvers, and System.map. `modules_prepare` alone is insufficient.
 make -C linux KMI_SRC=/path/to/phone-common KMI_OUT=/path/to/gki-out \
   ARCH=arm64 LLVM=/usr/bin/
 ```
+
+Kbuild compiles the engine archive into `out/linux-cargo`, not into the Cargo
+host directory. `EFVS_CARGO_TARGET_DIR` declares that directory. Its default is
+`$(src)/../out/linux-cargo`, which is the repository `out/` directory, and this
+default is ignored by Git. Pass `EFVS_CARGO_TARGET_DIR` to select another
+directory. The archive path is
+`$(EFVS_CARGO_TARGET_DIR)/<Rust target>/release/libefivar_store_ffi.a`, where
+`<Rust target>` is `aarch64-unknown-none-softfloat` or `efvs-x86_64`.
+
+To build the engine archive alone, run the same Cargo command without Kbuild:
+
+```sh
+CARGO_TARGET_DIR=out/linux-cargo \
+RUSTFLAGS="-Z unstable-options -C relocation-model=static -C panic=immediate-abort -C force-unwind-tables=no -C embed-bitcode=no" \
+  cargo +nightly-2026-08-08 build --locked --offline -Zjson-target-spec \
+  -Z build-std=core,compiler_builtins --release \
+  --target aarch64-unknown-none-softfloat -p efivar-store-ffi --no-default-features
+```
+
+The result is `out/linux-cargo/aarch64-unknown-none-softfloat/release/libefivar_store_ffi.a`.
+This archive build needs no kernel source. For an x86 kernel, first generate the
+JSON target with `linux/rust-target.py`, then pass its path to `--target`.
+
+Two toolchains stay separate. The root `rust-toolchain.toml` keeps `stable` for
+host and firmware crates. Only the Linux build selects `nightly-2026-08-08`, and
+it also needs the `rust-src` component.
 
 The Makefile works both through its outer target and direct ACK kbuild (including
 the egysk pinned-source builder). It builds the staticlib offline with pinned

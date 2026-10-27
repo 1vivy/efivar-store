@@ -1,4 +1,5 @@
 /target/
+/out/
 /.worktrees/
 /linux/__pycache__/
 /linux/*.build.log

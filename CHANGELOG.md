@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Build: the Linux Kbuild now writes the freestanding engine archive under a
+  declared directory, `EFVS_CARGO_TARGET_DIR`, which defaults to `out/linux-cargo`.
+  It no longer uses the source-relative `target/` path. The root
+  `rust-toolchain.toml` keeps `stable`, and only the Linux build selects
+  `nightly-2026-08-08`. `docs/linux.md` and `README.md` give the host and
+  freestanding build commands.
+
 - Align the UEFI provider's canonical ABI types with Patina's r-efi 7.1.0;
   variable routing, wire formats and runtime policy are unchanged.
 - Port the runtime-code reclamation correction from the divergent gobbl vendored

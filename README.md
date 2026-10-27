@@ -88,6 +88,19 @@ Tier 0 under Policy None does **not** claim authenticated integrity.
 
 The byte layouts of all three, with offsets, are in [docs/format.md](docs/format.md).
 
+## Building
+
+Host crates use `stable` from `rust-toolchain.toml` and write to `target/`:
+
+```sh
+cargo build --locked
+```
+
+The Linux kernel backend builds a freestanding engine archive into `out/linux-cargo`
+with pinned `nightly-2026-08-08`. See
+[docs/linux.md](docs/linux.md#host-build) and
+[docs/linux.md](docs/linux.md#freestanding-build) for the commands and the archive path.
+
 ## Usage
 
 ### UEFI service

@@ -2,6 +2,7 @@
 CARGO ?= $(HOME)/.cargo/bin/cargo
 RUST_TOOLCHAIN ?= nightly-2026-08-08
 EFVS_RUSTC ?= $(dir $(CARGO))rustc
+EFVS_CARGO_TARGET_DIR ?= $(abspath $(src)/../out/linux-cargo)
 ifeq ($(ARCH),arm64)
 RUST_TARGET := aarch64-unknown-none-softfloat
 RUST_TARGET_DIR := $(RUST_TARGET)
@@ -42,15 +43,16 @@ ifeq ($(CONFIG_CALL_PADDING),y)
 RUST_FLAGS += -Zpatchable-function-entry=$(CONFIG_FUNCTION_PADDING_BYTES),$(CONFIG_FUNCTION_PADDING_BYTES)
 endif
 endif
+EFVS_RUST_ARCHIVE := $(abspath $(EFVS_CARGO_TARGET_DIR))/$(RUST_TARGET_DIR)/release/libefivar_store_ffi.a
 obj-m := efivar_store.o
 efivar_store-objs := efivar_store_glue.o efvs_engine.o
 $(obj)/efivar_store_glue.o: $(src)/efivar_store.c FORCE
 	$(call if_changed_dep,cc_o_c)
 # Cargo tracks all engine sources; both ACK/DDK and standalone kbuild enter here.
-$(src)/../target/$(RUST_TARGET_DIR)/release/libefivar_store_ffi.a: $(EFVS_TARGET_DEP) $(src)/rustc-wrapper.py $(src)/compiler-builtins.rs FORCE
-	cd "$(src)/.." && RUSTC="$(EFVS_RUSTC)" RUSTC_WRAPPER="$(abspath $(src)/rustc-wrapper.py)" CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 RUSTFLAGS="$(RUST_FLAGS)" $(CARGO) +$(RUST_TOOLCHAIN) build --locked --offline -Zjson-target-spec -Z build-std=core,compiler_builtins --release --target $(RUST_TARGET) -p efivar-store-ffi --no-default-features
+$(EFVS_RUST_ARCHIVE): $(EFVS_TARGET_DEP) $(src)/rustc-wrapper.py $(src)/compiler-builtins.rs FORCE
+	cd "$(src)/.." && RUSTC="$(EFVS_RUSTC)" RUSTC_WRAPPER="$(abspath $(src)/rustc-wrapper.py)" CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 RUSTFLAGS="$(RUST_FLAGS)" $(CARGO) +$(RUST_TOOLCHAIN) build --locked --offline --target-dir "$(abspath $(EFVS_CARGO_TARGET_DIR))" -Zjson-target-spec -Z build-std=core,compiler_builtins --release --target $(RUST_TARGET) -p efivar-store-ffi --no-default-features
 quiet_cmd_efvs = LD      $@
       cmd_efvs = $(LD) -r --gc-sections $(addprefix -u ,efvs_ctx_size efvs_scratch_size efvs_load efvs_get efvs_next efvs_set efvs_query) --whole-archive $< --no-whole-archive -o $@
-$(obj)/efvs_engine.o: $(src)/../target/$(RUST_TARGET_DIR)/release/libefivar_store_ffi.a FORCE
+$(obj)/efvs_engine.o: $(EFVS_RUST_ARCHIVE) FORCE
 	$(call if_changed,efvs)
 targets += efvs_engine.o efivar_store_glue.o

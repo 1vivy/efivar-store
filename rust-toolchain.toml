@@ -1,5 +1,5 @@
-# The core crate compiles on stable; the gobbl workspace pinned a nightly for its UEFI
-# `-Zbuild-std` lanes, which this repository does not need.
+# Host and firmware crates use stable. Linux Kbuild separately selects
+# nightly-2026-08-08 with rust-src for its freestanding build.
 [toolchain]
 channel = "stable"
 profile = "minimal"
