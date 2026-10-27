@@ -90,7 +90,8 @@ The byte layouts of all three, with offsets, are in [docs/format.md](docs/format
 
 ## Building
 
-Host crates use `stable` from `rust-toolchain.toml` and write to `target/`:
+Host crates use `stable` from `rust-toolchain.toml` and write to the ignored
+`out/cargo/` directory, which `.cargo/config.toml` selects:
 
 ```sh
 cargo build --locked

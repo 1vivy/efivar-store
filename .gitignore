@@ -1,3 +1,4 @@
+# Safety net: .cargo/config.toml sends Cargo output to out/cargo.
 /target/
 /out/
 /.worktrees/

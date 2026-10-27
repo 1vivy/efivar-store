@@ -8,6 +8,8 @@
   `rust-toolchain.toml` keeps `stable`, and only the Linux build selects
   `nightly-2026-08-08`. `docs/linux.md` and `README.md` give the host and
   freestanding build commands.
+- Build: `.cargo/config.toml` sets `target-dir` to `out/cargo`, so host Cargo
+  output stays in the ignored `out/` tree instead of `target/`.
 
 - Align the UEFI provider's canonical ABI types with Patina's r-efi 7.1.0;
   variable routing, wire formats and runtime policy are unchanged.

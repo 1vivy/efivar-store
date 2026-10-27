@@ -111,8 +111,9 @@ decoded descriptor, not scanning reclaimable boot memory from an external LKM.
 ## Host build
 
 The root `rust-toolchain.toml` selects `stable` for the host crates: the storage
-engine, the UEFI service, the FFI crate and the CLI. Cargo writes host output to
-the ignored `target/` directory. Set `CARGO_TARGET_DIR` to place it elsewhere.
+engine, the UEFI service, the FFI crate and the CLI. `.cargo/config.toml` sets
+`target-dir`, so Cargo writes host output to the ignored `out/cargo/` directory.
+`CARGO_TARGET_DIR` overrides it.
 
 ```sh
 cargo build --locked
@@ -305,7 +306,7 @@ cargo clippy --workspace --all-targets --locked --offline -- -D warnings
 python3 -m unittest discover -s linux -p 'test_rust*.py'
 python3 linux/test_qemu.py --kernel-out /path/to/gki-out \
   --backend /path/to/arm64/efivar_store.ko --frontend /path/to/efivarfs.ko \
-  --busybox /path/to/static-arm64-busybox --cli target/debug/efivar-store \
+  --busybox /path/to/static-arm64-busybox --cli out/cargo/debug/efivar-store \
   --loader /path/to/lkm-loader \
   --partuuid f5a3bc0f-4dea-56c6-aeed-cb638157a125 \
   --work /var/tmp/efvs-uuid-proof
