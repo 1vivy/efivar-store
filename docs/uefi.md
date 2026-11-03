@@ -73,6 +73,32 @@ It remains true when a failed `CloseEvent` retains an EBS callback: event contex
 code, private runtime table and referenced snapshot stay allocated. This is a terminal
 ownership outcome requiring a cold reset, not a successful service or a retry opportunity.
 
+## Namespace routing
+
+`variables::Service` decides one route per key: `Route::Firmware` serves the key
+from the saved firmware callbacks, and `Route::Store { volatile }` serves it from
+the managed store, where `volatile: true` also admits boot-local overlay values
+for the same key. `Route` applies to reads, writes, deletion, enumeration
+(GetNextVariableName), the firmware capture and the runtime index, so a routed
+key never answers from both sides and never appears twice in enumeration.
+
+Two decision functions exist, and the service applies both consistently to every
+key:
+
+- `Policy = fn(&Guid) -> Route` decides by vendor GUID. It is the whole decision
+  unless a name policy is selected.
+- `NamePolicy = fn(&Guid, &[u16]) -> Option<Route>` decides by GUID and name.
+  `Some(route)` decides that key; `None` defers it to the `Policy`. A consumer
+  selects one when a single GUID must route by name, such as the EFI global
+  namespace whose boot names belong to the store while `BootCurrent` stays with
+  the firmware.
+
+`Service::open` captures the firmware namespace under the GUID policy. When the
+routing selection is itself a stored value, use `Service::open_uncaptured`, read
+the value from the returned `service.store`, call `Service::select_names`, then
+call `Service::capture`. Capture and the runtime index follow the selection, so
+the selection precedes both. `VariableService::install` uses the GUID policy only.
+
 ## OS discovery
 
 The EFVS table describes the store to EFI consumers. An out-of-tree Linux module cannot

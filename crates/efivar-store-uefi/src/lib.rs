@@ -11,4 +11,4 @@ pub mod migration;
 pub mod service;
 pub mod variables;
 pub use service::{VariableService, inspect, installed};
-pub use variables::{Policy, Route};
+pub use variables::{NamePolicy, Policy, Route};

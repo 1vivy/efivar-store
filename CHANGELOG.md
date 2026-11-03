@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Add `variables::NamePolicy`, a `(GUID, name) -> Option<Route>` decision the
+  service applies before the unchanged GUID `Policy`; `None` defers to the GUID
+  decision. The service applies it to reads, writes, enumeration, firmware
+  capture and the runtime index. `Service::open_uncaptured`,
+  `Service::select_names` and `Service::capture` let a consumer read a selection
+  from the opened store before capture decides which firmware names stay
+  visible. `Service::open` and `VariableService::install` keep the GUID-only
+  behaviour, and the firmware adapter no longer applies a second routing filter.
+
 - Move the store crates to edition 2024 and Rust 1.88. The Rust 1.82
   source-embedding floor constrained no current consumer: firmware and host
   builds use Rust 1.95, and the Linux module uses its pinned nightly. The crates

@@ -83,9 +83,31 @@ pub enum Route {
     },
 }
 /// The consumer's `GUID -> Route` decision function.
+///
+/// The service applies it to every key that a [`NamePolicy`] leaves undecided.
+/// Evaluate it only before ExitBootServices.
 pub type Policy = fn(&Guid) -> Route;
-fn managed(policy: Policy, guid: &Guid) -> bool {
-    matches!(policy(guid), Route::Store { .. })
+/// The consumer's `(GUID, name) -> Route` decision function.
+///
+/// The service consults it before the [`Policy`] for every key. `Some(route)`
+/// decides that key; `None` defers to the GUID decision. A consumer selects this
+/// policy when one GUID must route by name, such as the EFI global namespace
+/// whose boot names belong to the store while `BootCurrent` stays with the
+/// firmware. Evaluate it only before ExitBootServices.
+pub type NamePolicy = fn(&Guid, &[u16]) -> Option<Route>;
+/// The route one key takes: the name decision first, then the GUID decision.
+fn route(policy: Policy, names: Option<NamePolicy>, name: &[u16], guid: &Guid) -> Route {
+    names
+        .and_then(|names| names(guid, name))
+        .unwrap_or_else(|| policy(guid))
+}
+/// Whether `(name, guid)` routes to the managed store.
+fn routed(policy: Policy, names: Option<NamePolicy>, name: &[u16], guid: &Guid) -> bool {
+    is_store(route(policy, names, name, guid))
+}
+/// Whether `route` serves the value from the managed store.
+fn is_store(route: Route) -> bool {
+    matches!(route, Route::Store { .. })
 }
 
 /// Whether `name` is a legal UEFI variable name.
@@ -133,6 +155,8 @@ pub struct Service<I, F, V = efvs::PolicyNone> {
     pub store: Efvs<I, V>,
     /// The GUID routing decision.
     pub policy: Policy,
+    /// The name-aware routing decision, consulted before [`Service::policy`].
+    names: Option<NamePolicy>,
     /// The firmware namespace the policy keeps on firmware.
     pub firmware: F,
     overlay: Vec<Variable>,
@@ -143,23 +167,73 @@ pub struct Service<I, F, V = efvs::PolicyNone> {
 
 impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
     /// Open the managed store and capture the firmware runtime variables the
-    /// policy keeps on firmware.
+    /// GUID policy keeps on firmware.
+    ///
+    /// Use [`Service::open_uncaptured`], [`Service::select_names`] and
+    /// [`Service::capture`] instead when a value in the store decides the
+    /// routing.
     pub fn open(
         io: I,
-        mut firmware: F,
+        firmware: F,
         manifest: Manifest,
         policy: Policy,
         verifier: V,
         anchor: &mut impl efvs::AnchorOps,
     ) -> Result<Self, Error> {
-        let store = Efvs::open(io, manifest, verifier, anchor)?;
-        let mut capture_truncated = false;
+        let mut service = Self::open_uncaptured(io, firmware, manifest, policy, verifier, anchor)?;
+        service.capture()?;
+        Ok(service)
+    }
+
+    /// Open the managed store without capturing the firmware namespace.
+    ///
+    /// The caller reads any routing selection from `service.store`, calls
+    /// [`Service::select_names`], then calls [`Service::capture`]. Capture reads
+    /// the firmware namespace, so it runs after the selection: the selection
+    /// decides which firmware names stay visible.
+    pub fn open_uncaptured(
+        io: I,
+        firmware: F,
+        manifest: Manifest,
+        policy: Policy,
+        verifier: V,
+        anchor: &mut impl efvs::AnchorOps,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            store: Efvs::open(io, manifest, verifier, anchor)?,
+            policy,
+            names: None,
+            firmware,
+            overlay: Vec::new(),
+            captured: Vec::new(),
+            capture_truncated: false,
+        })
+    }
+
+    /// Select the name-aware routing decision, replacing any earlier one.
+    ///
+    /// Select before [`Service::capture`], which copies the firmware names the
+    /// routing keeps on firmware. Every later read, write, enumeration and
+    /// snapshot decides each key again through the same routing.
+    pub fn select_names(&mut self, names: Option<NamePolicy>) {
+        self.names = names;
+    }
+
+    /// Capture the firmware runtime variables the current routing keeps on
+    /// firmware, replacing the captured set.
+    ///
+    /// [`Service::open`] calls it once. A second call reflects the current
+    /// selection, so a consumer that reselects the routing recaptures.
+    pub fn capture(&mut self) -> Result<(), Error> {
+        let policy = self.policy;
+        let names = self.names;
+        let listed = self.firmware.list()?;
         let mut captured = Vec::new();
         let mut bytes = 0;
-        for v in firmware
-            .list()?
+        let mut truncated = false;
+        for v in listed
             .into_iter()
-            .filter(|v| !managed(policy, &v.guid) && v.attributes & RT != 0)
+            .filter(|v| !routed(policy, names, &v.name, &v.guid) && v.attributes & RT != 0)
         {
             let size = index::RECORD + (v.name.len() + 1) * 2 + v.data.len() + 7;
             if !valid_name(&v.name)
@@ -167,21 +241,34 @@ impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
                 || captured.len() == 256
                 || bytes + size > 512 * 1024
             {
-                capture_truncated = true;
+                truncated = true;
             } else {
                 bytes += size;
                 captured.push(v);
             }
         }
-        capture_truncated |= firmware.truncated();
-        Ok(Self {
-            store,
-            policy,
-            firmware,
-            overlay: Vec::new(),
-            captured,
-            capture_truncated,
-        })
+        truncated |= self.firmware.truncated();
+        self.captured = captured;
+        self.capture_truncated |= truncated;
+        Ok(())
+    }
+
+    /// The route one key takes.
+    pub fn route(&self, name: &[u16], guid: &Guid) -> Route {
+        route(self.policy, self.names, name, guid)
+    }
+
+    /// Whether one key routes to the managed store.
+    fn managed(&self, name: &[u16], guid: &Guid) -> bool {
+        routed(self.policy, self.names, name, guid)
+    }
+
+    /// Whether one stored key routes to the managed store.
+    fn managed_stored(&self, name: &[u8], guid: &Guid) -> bool {
+        match self.names {
+            Some(names) => names(guid, &units(name).collect::<Vec<_>>()).is_some_and(is_store),
+            None => is_store((self.policy)(guid)),
+        }
     }
 
     /// Size of the managed store image in bytes.
@@ -193,9 +280,9 @@ impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
         self.store.reload()
     }
 
-    /// Read one variable through the route its GUID selects.
+    /// Read one variable through the route its GUID and name select.
     pub fn get(&mut self, name: &[u16], guid: &Guid) -> Result<Variable, Error> {
-        if !managed(self.policy, guid) {
+        if !self.managed(name, guid) {
             return self.firmware.get(name, guid);
         }
         let (attributes, data) = self.managed_value(name, guid)?;
@@ -210,7 +297,7 @@ impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
     /// Borrow a managed value directly from the cache/overlay. EFI GetVariable
     /// can copy into the caller's output without allocating a temporary value.
     pub fn managed_value(&mut self, name: &[u16], guid: &Guid) -> Result<(u32, &[u8]), Error> {
-        if !managed(self.policy, guid) {
+        if !self.managed(name, guid) {
             return Err(Error::Unsupported);
         }
         if !valid_name(name) {
@@ -227,7 +314,7 @@ impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
         self.store.get(name, guid)
     }
 
-    /// Write one variable through the route its GUID selects.
+    /// Write one variable through the route its GUID and name select.
     pub fn set(
         &mut self,
         name: &[u16],
@@ -235,7 +322,7 @@ impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
         attributes: u32,
         data: &[u8],
     ) -> Result<(), Error> {
-        if !managed(self.policy, guid) {
+        if !self.managed(name, guid) {
             self.firmware.set(name, guid, attributes, data)?;
             self.refresh_capture(name, guid);
             return Ok(());
@@ -277,7 +364,7 @@ impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
                 && self
                     .store
                     .variables()?
-                    .filter(|v| managed(self.policy, &v.guid) && v.attributes & RT != 0)
+                    .filter(|v| self.managed_stored(v.name, &v.guid) && v.attributes & RT != 0)
                     .count()
                     + self
                         .overlay
@@ -297,7 +384,7 @@ impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
             if !deleting {
                 validate_attributes(attributes)?;
             }
-            if !matches!((self.policy)(guid), Route::Store { volatile: true }) {
+            if !matches!(self.route(name, guid), Route::Store { volatile: true }) {
                 return Err(Error::Unsupported);
             }
             let old = previous.as_ref().map_or(0, |v| (name.len() + 1) * 2 + v.1);
@@ -338,7 +425,7 @@ impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
                     .sum();
                 let managed_count = self.store.variables().map_or(MAX_VARIABLES, |variables| {
                     variables
-                        .filter(|v| managed(self.policy, &v.guid) && v.attributes & RT != 0)
+                        .filter(|v| self.managed_stored(v.name, &v.guid) && v.attributes & RT != 0)
                         .count()
                 });
                 if valid_name(&v.name)
@@ -374,7 +461,7 @@ impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
         let mut values: Vec<_> = self
             .store
             .variables()?
-            .filter(|v| managed(self.policy, &v.guid))
+            .filter(|v| self.managed_stored(v.name, &v.guid))
             .map(|v| Key {
                 name: units(v.name).collect(),
                 guid: v.guid,
@@ -394,7 +481,7 @@ impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
                 guid: v.guid,
             })
             .collect();
-        firmware.retain(|v| !managed(self.policy, &v.guid));
+        firmware.retain(|v| !self.managed(&v.name, &v.guid));
         firmware.sort_by(|a, b| (&a.guid, &a.name).cmp(&(&b.guid, &b.name)));
         firmware.dedup_by(|a, b| a.guid == b.guid && a.name == b.name);
         values.extend(firmware);
@@ -418,19 +505,15 @@ impl<I: Storage, F: Firmware, V: efvs::Verifier> Service<I, F, V> {
         );
         let mut builder = index::Builder::new(output, self.capture_truncated)?;
         builder.capacity(nv, volatile);
-        let mut values: Vec<_> = self
-            .store
-            .variables()?
-            .filter(|v| managed(self.policy, &v.guid) && v.attributes & RT != 0)
-            .map(|v| {
-                (
-                    v.guid,
-                    units(v.name).collect::<Vec<_>>(),
-                    v.attributes,
-                    v.data,
-                )
-            })
-            .collect();
+        let policy = self.policy;
+        let names = self.names;
+        let mut values: Vec<_> = Vec::new();
+        for v in self.store.variables()? {
+            let name: Vec<u16> = units(v.name).collect();
+            if v.attributes & RT != 0 && routed(policy, names, &name, &v.guid) {
+                values.push((v.guid, name, v.attributes, v.data));
+            }
+        }
         values.extend(
             self.overlay
                 .iter()

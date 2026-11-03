@@ -6,7 +6,6 @@ use r_efi::efi::{self, Status};
 pub(crate) struct Original {
     pub(crate) table: NonNull<efi::RuntimeServices>,
     pub(crate) truncated: bool,
-    pub(crate) policy: variables::Policy,
 }
 impl Original {
     pub(crate) fn services(&self) -> &'static efi::RuntimeServices {
@@ -207,9 +206,6 @@ impl Firmware for Original {
             }
             let key = &name[..size / 2 - 1];
             let key_guid = guid_bytes(&guid);
-            if matches!((self.policy)(&key_guid), variables::Route::Store { .. }) {
-                continue;
-            }
             match self.get(key, &key_guid) {
                 Ok(v) if v.attributes & variables::RT != 0 => {
                     let length =

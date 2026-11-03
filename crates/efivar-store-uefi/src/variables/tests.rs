@@ -6,6 +6,10 @@ pub const BLI: Guid = [
 pub const PROJECT: Guid = [
     0x1c, 0x4b, 0x5e, 0x7a, 0x3f, 0x0d, 0x62, 0x4e, 0x9b, 0x8a, 0x1c, 0x2d, 0x3e, 0x4f, 0x5a, 0x6b,
 ];
+/// `EFI_GLOBAL_VARIABLE`.
+pub const GLOBAL: Guid = [
+    0x61, 0xdf, 0xe4, 0x8b, 0xca, 0x93, 0xd2, 0x11, 0xaa, 0x0d, 0x00, 0xe0, 0x98, 0x03, 0x2b, 0x8c,
+];
 fn policy(guid: &Guid) -> Route {
     if *guid == BLI {
         Route::Store { volatile: true }
@@ -14,6 +18,50 @@ fn policy(guid: &Guid) -> Route {
     } else {
         Route::Firmware
     }
+}
+
+/// Whether `name` is one of the global boot names the tests route to the store.
+fn boot_name(name: &[u16]) -> bool {
+    ["BootOrder", "BootNext"]
+        .iter()
+        .any(|candidate| name == candidate.encode_utf16().collect::<Vec<_>>().as_slice())
+}
+
+/// Routes the selected global boot names to the store and defers everything
+/// else to [`policy`].
+fn names(guid: &Guid, name: &[u16]) -> Option<Route> {
+    (*guid == GLOBAL && boot_name(name)).then_some(Route::Store { volatile: true })
+}
+
+/// Opens a service over a fresh store and the supplied firmware namespace,
+/// without capturing it.
+fn open_names(values: &[(&str, u32, &[u8])]) -> Service<Memory, Fake> {
+    let mut bytes = vec![0; 64 * 1024];
+    efvs::initialize(&mut bytes, 16 * 1024).unwrap();
+    let mut firmware = Fake::default();
+    for (key, attributes, data) in values {
+        firmware
+            .set(&name(key), &GLOBAL, *attributes, data)
+            .unwrap();
+    }
+    Service::open_uncaptured(
+        Memory {
+            bytes,
+            writes: 0,
+            fail: false,
+        },
+        firmware,
+        Manifest {
+            size: 64 * 1024,
+            checkpoint_capacity: 16 * 1024,
+            write_unit: 4096,
+            partition_guid: PROJECT,
+        },
+        policy,
+        efvs::PolicyNone,
+        &mut efvs::NoneAnchor::new(),
+    )
+    .unwrap()
 }
 
 use efivar_store::{
@@ -208,6 +256,117 @@ fn volatile_overlay_never_persists_and_enumeration_suppresses_firmware_managed_k
     );
     service.set(&key, &BLI, 0, &[]).unwrap();
     assert_eq!(service.get(&key, &BLI), Err(Error::NotFound));
+}
+#[test]
+fn selected_names_route_to_the_store_under_their_real_guid() {
+    let mut service = open_names(&[("BootOrder", 6, b"firmware"), ("BootCurrent", 6, b"\0\0")]);
+    service.select_names(Some(names));
+    service.capture().unwrap();
+    // A routed read answers the store, so the inherited firmware value stays
+    // invisible until the caller writes the selected key.
+    assert_eq!(
+        service.get(&name("BootOrder"), &GLOBAL),
+        Err(Error::NotFound)
+    );
+    service
+        .set(&name("BootOrder"), &GLOBAL, 7, b"stored")
+        .unwrap();
+    assert_eq!(
+        service.get(&name("BootOrder"), &GLOBAL).unwrap().data,
+        b"stored"
+    );
+    assert_eq!(
+        service
+            .firmware
+            .get(&name("BootOrder"), &GLOBAL)
+            .unwrap()
+            .data,
+        b"firmware"
+    );
+    // The value persists in the store under the global namespace and name.
+    assert_eq!(
+        disk_value(&service.store.io.bytes, &name("BootOrder"), &GLOBAL).unwrap(),
+        b"stored"
+    );
+    assert!(disk_value(&service.store.io.bytes, &name("BootOrder"), &PROJECT).is_none());
+    // A volatile write to the same name stays in the boot-local overlay.
+    service
+        .set(&name("BootNext"), &GLOBAL, 6, b"\x00\x01")
+        .unwrap();
+    assert!(disk_value(&service.store.io.bytes, &name("BootNext"), &GLOBAL).is_none());
+    assert_eq!(
+        service.get(&name("BootNext"), &GLOBAL).unwrap().data,
+        b"\x00\x01"
+    );
+    // An unselected name keeps its firmware answer and firmware persistence.
+    service.set(&name("BootCurrent"), &GLOBAL, 0, &[]).unwrap();
+    assert_eq!(
+        service.get(&name("BootCurrent"), &GLOBAL),
+        Err(Error::NotFound)
+    );
+    assert!(disk_value(&service.store.io.bytes, &name("BootCurrent"), &GLOBAL).is_none());
+}
+#[test]
+fn enumeration_lists_each_selected_name_once() {
+    let mut service = open_names(&[("BootOrder", 6, b"firmware"), ("BootCurrent", 6, b"\0\0")]);
+    service.select_names(Some(names));
+    service.capture().unwrap();
+    service
+        .set(&name("BootOrder"), &GLOBAL, 7, b"stored")
+        .unwrap();
+    let list = service.list().unwrap();
+    let keys: Vec<_> = list
+        .iter()
+        .filter(|key| key.guid == GLOBAL)
+        .map(|key| key.name.clone())
+        .collect();
+    // Managed keys come first, then the firmware keys, so the routed name is
+    // listed once and before the firmware-owned one.
+    assert_eq!(keys, vec![name("BootOrder"), name("BootCurrent")]);
+}
+#[test]
+fn capture_follows_the_selected_names() {
+    let mut service = open_names(&[("BootOrder", 6, b"firmware")]);
+    let mut snapshot = vec![0; index::CAPACITY];
+    // Before the selection, capture keeps the firmware copy in the runtime view.
+    service.capture().unwrap();
+    service.snapshot(&mut snapshot).unwrap();
+    assert!(
+        index::Reader::parse(&snapshot)
+            .unwrap()
+            .get(&name("BootOrder"), &GLOBAL)
+            .is_ok()
+    );
+    // After the selection, the name belongs to the store and capture drops it.
+    service.select_names(Some(names));
+    service.capture().unwrap();
+    service.snapshot(&mut snapshot).unwrap();
+    assert!(
+        index::Reader::parse(&snapshot)
+            .unwrap()
+            .get(&name("BootOrder"), &GLOBAL)
+            .is_err()
+    );
+}
+#[test]
+fn name_policy_defers_to_the_guid_policy() {
+    let mut service = open_names(&[("BootOrder", 6, b"firmware")]);
+    service.select_names(Some(|_, _| None));
+    service.capture().unwrap();
+    // The GUID policy still owns the project namespace and the firmware names.
+    service.set(&name("Slot-rom1"), &PROJECT, 7, b"a").unwrap();
+    assert_eq!(
+        service.get(&name("BootOrder"), &GLOBAL).unwrap().data,
+        b"firmware"
+    );
+    let mut snapshot = vec![0; index::CAPACITY];
+    service.snapshot(&mut snapshot).unwrap();
+    assert!(
+        index::Reader::parse(&snapshot)
+            .unwrap()
+            .get(&name("BootOrder"), &GLOBAL)
+            .is_ok()
+    );
 }
 #[test]
 fn snapshot_tracks_pre_ebs_updates_and_is_stale_after_direct_write() {

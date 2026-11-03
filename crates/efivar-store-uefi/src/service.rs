@@ -122,7 +122,6 @@ impl VariableService {
             firmware::Original {
                 table: original,
                 truncated: false,
-                policy,
             },
             manifest,
             policy,
