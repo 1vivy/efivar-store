@@ -8,6 +8,7 @@
 #include <linux/ctype.h>
 #include <linux/efi.h>
 #include <linux/fs.h>
+#include <linux/filelock.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -37,17 +38,20 @@ void __noreturn efvs_panic(void)
 	panic("efivar_store: engine invariant failure");
 }
 
-static char *dev, *partuuid;
+static char *dev, *partuuid, *path;
 static char selected_uuid[37];
 module_param(dev, charp, 0);
 MODULE_PARM_DESC(dev, "Backing block device as major:minor");
 module_param(partuuid, charp, 0);
 MODULE_PARM_DESC(partuuid, "Backing partition unique GUID");
+module_param(path, charp, 0);
+MODULE_PARM_DESC(path, "Absolute path to an existing regular EFVS file; exclusive owner");
 static DEFINE_MUTEX(store_lock);
 static struct file *store_file;
 static void *context;
 static u8 *image, *scratch;
 static size_t image_len, scratch_len;
+static loff_t backing_len;
 static bool ready;
 module_param(ready, bool, 0444);
 MODULE_PARM_DESC(ready, "validated backing and registered EFI callbacks (read-only)");
@@ -287,12 +291,86 @@ static int discover_device(dev_t *result)
 	of_node_put(chosen);
 	return rc;
 }
+
+static int claim_file(void)
+{
+#ifdef CONFIG_FILE_LOCKING
+	struct file_lock *lock = locks_alloc_lock();
+	int rc;
+
+	if (!lock)
+		return -ENOMEM;
+	lock->c.flc_owner = store_file;
+	lock->c.flc_file = store_file;
+	lock->c.flc_flags = FL_FLOCK;
+	lock->c.flc_type = F_WRLCK;
+	lock->fl_start = 0;
+	lock->fl_end = OFFSET_MAX;
+	/* No FL_SLEEP: refuse an existing owner instead of blocking module load. */
+	rc = locks_lock_file_wait(store_file, lock);
+	locks_free_lock(lock);
+	return rc;
+#else
+	return -EOPNOTSUPP;
+#endif
+}
+
+static int open_store(dev_t *device)
+{
+	struct block_device *backing;
+	int rc;
+
+	if (path) {
+		if (dev || partuuid || path[0] != '/')
+			return -EINVAL;
+		store_file = filp_open(path, O_RDWR | O_NOFOLLOW | O_NONBLOCK, 0);
+	} else {
+		rc = discover_device(device);
+		if (rc)
+			return rc;
+		store_file = bdev_file_open_by_dev(*device, BLK_OPEN_READ | BLK_OPEN_WRITE,
+						 THIS_MODULE, NULL);
+	}
+	if (IS_ERR(store_file)) {
+		rc = PTR_ERR(store_file);
+		store_file = NULL;
+		return rc;
+	}
+	if (path) {
+		if (!S_ISREG(file_inode(store_file)->i_mode))
+			return -EINVAL;
+		backing_len = i_size_read(file_inode(store_file));
+		if (backing_len < 512 || backing_len > MAX_IMAGE)
+			return -EINVAL;
+		return claim_file();
+	}
+	backing = file_bdev(store_file);
+	if (selected_uuid[0] &&
+	    (!backing->bd_meta_info ||
+	     strncasecmp(backing->bd_meta_info->uuid, selected_uuid, 36)))
+		return -ENODEV;
+	backing_len = bdev_nr_bytes(backing);
+	return 0;
+}
+
+static bool backing_valid(void)
+{
+	return !path || (S_ISREG(file_inode(store_file)->i_mode) &&
+			file_inode(store_file)->i_nlink &&
+			i_size_read(file_inode(store_file)) == backing_len);
+}
+
 /* Override only actual backing-file I/O, never the EFI caller's other work. */
 static int read_bytes(size_t offset, void *buffer, size_t len)
 {
 	loff_t pos = offset;
-	const struct cred *old = override_creds(store_file->f_cred);
-	ssize_t n = kernel_read(store_file, buffer, len, &pos);
+	const struct cred *old;
+	ssize_t n;
+
+	if (!backing_valid() || offset > backing_len || len > backing_len - offset)
+		return -EIO;
+	old = override_creds(store_file->f_cred);
+	n = kernel_read(store_file, buffer, len, &pos);
 
 	revert_creds(old);
 
@@ -305,9 +383,14 @@ static int read_bytes(size_t offset, void *buffer, size_t len)
 static int write_bytes(size_t start, size_t end)
 {
 	loff_t pos = start;
-	const struct cred *old = override_creds(store_file->f_cred);
-	ssize_t n = kernel_write(store_file, image + start, end - start, &pos);
+	const struct cred *old;
+	ssize_t n;
 	int rc;
+
+	if (!backing_valid() || start > end || end > backing_len)
+		return -EIO;
+	old = override_creds(store_file->f_cred);
+	n = kernel_write(store_file, image + start, end - start, &pos);
 
 	revert_creds(old);
 
@@ -363,7 +446,7 @@ static int load(void)
 		if (n >= offset + sizeof(header) && n <= MAX_IMAGE)
 			length = max_t(size_t, length, n);
 	}
-	if (!length)
+	if (!length || length != backing_len)
 		return -EINVAL;
 	image_len = length;
 	image = kvmalloc(image_len, GFP_KERNEL);
@@ -522,35 +605,21 @@ static const struct efivar_operations ops = {
 };
 static int __init efivar_store_init(void)
 {
-	dev_t device;
-	struct block_device *backing;
-	int rc = discover_device(&device);
+	dev_t device = 0;
+	int rc;
+
 	/* Output-only even if the loader supplies ready=1. */
 	ready = false;
-	if (rc)
-		return rc;
-	/* Own the backing for the callback lifetime, like other block consumers. */
-	store_file = bdev_file_open_by_dev(device, BLK_OPEN_READ | BLK_OPEN_WRITE,
-					 THIS_MODULE, NULL);
-	if (IS_ERR(store_file)) {
-		rc = PTR_ERR(store_file);
-		pr_err("efivar_store: backing device open failed: %d\n", rc);
-		store_file = NULL;
+	rc = open_store(&device);
+	if (rc) {
+		pr_err("efivar_store: backing open failed: %d\n", rc);
 		release_store();
 		return rc;
-	}
-	/* A hotplug/reused dev_t must not turn UUID selection into another store. */
-	backing = file_bdev(store_file);
-	if (selected_uuid[0] &&
-	    (!backing->bd_meta_info ||
-	     strncasecmp(backing->bd_meta_info->uuid, selected_uuid, 36))) {
-		release_store();
-		return -ENODEV;
 	}
 	rc = load();
 	if (rc) {
-		pr_err("efivar_store: no usable EFVS store; firmware must initialize blank "
-		       "partitions (no bytes written)\n");
+		pr_err("efivar_store: no usable EFVS store; firmware or offline tooling must "
+		       "initialize blank backing (no bytes written)\n");
 		release_store();
 		return rc;
 	}
@@ -566,8 +635,11 @@ static int __init efivar_store_init(void)
 		release_store();
 		return rc;
 	}
-	pr_info("efivar_store: registered block-backed efivars (dev=%u:%u)\n", MAJOR(device),
-		MINOR(device));
+	if (path)
+		pr_info("efivar_store: registered file-backed efivars\n");
+	else
+		pr_info("efivar_store: registered block-backed efivars (dev=%u:%u)\n",
+			MAJOR(device), MINOR(device));
 	return 0;
 }
 static void __exit efivar_store_exit(void)
@@ -583,4 +655,4 @@ module_exit(efivar_store_exit);
 MODULE_LICENSE("GPL");
 MODULE_INFO(import_ns, "VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
 MODULE_AUTHOR("efivar-store contributors");
-MODULE_DESCRIPTION("Block-backed EFI variable service using the efivar-store Rust engine");
+MODULE_DESCRIPTION("File or block-backed EFI variables using the efivar-store Rust engine");

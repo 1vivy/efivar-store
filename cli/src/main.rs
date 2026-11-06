@@ -8,10 +8,13 @@
 //! releases the lock. Nothing here reclaims a live store: a full store fails
 //! and says so.
 //!
-//! `init` creates a standalone image from scratch. Creating a partition,
-//! choosing its size and GUID and reserving FTW space stay with the consumer
-//! (a provisioning tool, a firmware installer), never with this command.
+//! `init` creates a standalone image from scratch. `backing provision` creates only
+//! a fixed-size file inside an existing ESP and records the explicit selection.
+//! Creating or resizing a partition, choosing GPT layout and reserving FTW space
+//! stay with the consumer (a provisioning tool, a firmware installer), never with
+//! this command.
 
+mod backing;
 mod efvs;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -38,6 +41,10 @@ usage:
   efivar-store (--device PATH | --image PATH) delete --name N --guid G
   efivar-store (--device PATH | --image PATH) oneshot ENTRY-ID
   efivar-store (--device PATH | --image PATH) oneshot --clear
+  efivar-store backing inspect --esp PATH [--device PATH]
+  efivar-store backing provision --esp PATH --path REL --size BYTES --store-uuid G --esp-uuid G [--block BYTES] [--checkpoint BYTES]
+  efivar-store backing select --esp PATH --kind file --path REL --size BYTES --block BYTES --store-uuid G --esp-uuid G [--replace]
+  efivar-store backing select --esp PATH --kind partition --partition-uuid G --size BYTES --block BYTES --device PATH [--store-uuid G] [--replace]
   efivar-store help
 
 options:
@@ -49,6 +56,13 @@ options:
   --force            `init`: overwrite an existing image file
   --efvs             `init`: EFVS v1 live container (otherwise edk2 interop FV)
   --checkpoint BYTES EFVS capacity per checkpoint slot (default 131072; two slots)
+  --esp PATH         root of the mounted ESP that holds EFI/EFVS/store.cfg
+  --path REL         canonical volume-relative path of a file-backed store
+  --kind KIND        `backing select`: file or partition
+  --store-uuid G     stable store identity recorded in the selection
+  --esp-uuid G       unique partition GUID of the containing ESP
+  --partition-uuid G unique GPT partition GUID of a whole-partition store
+  --replace          `backing select`: replace an existing selection explicitly
   --name N           variable name; UTF-8 here, UTF-16LE on disk
   --guid G           EFI GUID in UUID text form, e.g. 4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
   --attributes HEX   EFI attributes, e.g. 0x7 = NV|BS|RT; NV|BS are required
@@ -65,6 +79,13 @@ commands:
   set       replace one variable through the durable phase sequence
   delete    delete one variable through the same sequence
   oneshot   set (or delete) the systemd Boot Loader Interface LoaderEntryOneShot
+  backing   provision a file-backed store or select an existing store on the ESP
+
+`backing provision` creates a new fixed-size EFVS image below the ESP and then
+writes EFI/EFVS/store.cfg. It refuses an existing image or selection. `backing
+select` records an existing file or partition and verifies the target's size;
+it refuses an existing selection unless `--replace` is explicit. An invalid
+selection is fatal at boot; it never falls back to partition discovery.
 
 `init` writes a fresh image file and refuses to replace an existing one unless
 `--force` is given; it never formats a `--device`.
@@ -82,7 +103,7 @@ const ONESHOT_NAME: &str = "LoaderEntryOneShot";
 const ONESHOT_ATTRIBUTES: u32 = 0x7;
 
 /// Options that always take one value.
-const OPTIONS: [&str; 12] = [
+const OPTIONS: [&str; 18] = [
     "--device",
     "--image",
     "--size",
@@ -95,9 +116,15 @@ const OPTIONS: [&str; 12] = [
     "--out",
     "--checkpoint",
     "--from",
+    "--esp",
+    "--path",
+    "--kind",
+    "--store-uuid",
+    "--esp-uuid",
+    "--partition-uuid",
 ];
 /// Flags that never take a value.
-const SWITCHES: [&str; 5] = ["--force", "--clear", "--help", "-h", "--efvs"];
+const SWITCHES: [&str; 6] = ["--force", "--clear", "--help", "-h", "--efvs", "--replace"];
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -215,6 +242,9 @@ fn run(args: &Args) -> Result<(), Failure> {
     if args.has("--help") || args.has("-h") || command == "help" {
         println!("{USAGE}");
         return Ok(());
+    }
+    if command == "backing" {
+        return backing::run(args);
     }
     if command == "init" && args.has("--efvs") {
         return efvs::create(args);

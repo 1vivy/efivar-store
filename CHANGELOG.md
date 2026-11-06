@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Add the versioned `BackingDescriptor` for an explicit partition or ESP-file
+  selection. Store identity is separate from its location. Configuration-table
+  version 2 carries the complete descriptor and rejects version 1 advertisements.
+  The EFVS data format remains version 1.
+- Add CLI provisioning, selection, and inspection for `EFI/EFVS/store.cfg`.
+  Provisioning refuses existing files. An explicit missing or invalid target is
+  an error, not permission to select another store.
+- Add regular-file backing to the optional Linux/DKMS adapter through `path=`.
+  The module holds an exclusive inode lock and retains the existing block-device
+  claim for partition backing. Both backends require exact image geometry.
+- Extend the Linux VM consumer to exercise FAT-file persistence and ownership.
+  The harness supports a built-in efivarfs frontend and explicitly clears the
+  immutable flag before it updates or deletes its disposable vendor variables.
+- Document independent backing, ownership, verification, and freshness contracts.
+  No new cryptographic construction or protected rollback guarantee is introduced.
+
 - Add `variables::NamePolicy`, a `(GUID, name) -> Option<Route>` decision the
   service applies before the unchanged GUID `Policy`; `None` defers to the GUID
   decision. The service applies it to reads, writes, enumeration, firmware

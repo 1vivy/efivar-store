@@ -1,11 +1,13 @@
 //! EFVS v1 shared, allocation-free wire format and replay. See `docs/efvs-v1.md`.
 mod anchor;
+mod backing;
 mod checkpoint;
 mod config_table;
 mod header;
 mod log;
 mod replay;
 pub use anchor::*;
+pub use backing::*;
 pub use checkpoint::*;
 pub use config_table::*;
 pub use header::*;

@@ -55,7 +55,7 @@ fn open_names(values: &[(&str, u32, &[u8])]) -> Service<Memory, Fake> {
             size: 64 * 1024,
             checkpoint_capacity: 16 * 1024,
             write_unit: 4096,
-            partition_guid: PROJECT,
+            backing: efvs::BackingDescriptor::partition(PROJECT, PROJECT, 64 * 1024, 4096).unwrap(),
         },
         policy,
         efvs::PolicyNone,
@@ -148,7 +148,7 @@ fn open(bytes: Vec<u8>) -> Result<Service<Memory, Fake>, Error> {
             size: 64 * 1024,
             checkpoint_capacity: 16 * 1024,
             write_unit: 4096,
-            partition_guid: PROJECT,
+            backing: efvs::BackingDescriptor::partition(PROJECT, PROJECT, 64 * 1024, 4096).unwrap(),
         },
         policy,
         efvs::PolicyNone,
@@ -624,7 +624,7 @@ fn next_boot_replays_os_log_and_compacts_torn_tail_before_append() {
             size: 64 * 1024,
             checkpoint_capacity: 16 * 1024,
             write_unit: 4096,
-            partition_guid: PROJECT,
+            backing: efvs::BackingDescriptor::partition(PROJECT, PROJECT, 64 * 1024, 4096).unwrap(),
         },
         policy,
         efvs::PolicyNone,
@@ -634,7 +634,9 @@ fn next_boot_replays_os_log_and_compacts_torn_tail_before_append() {
     assert_eq!(next.get(&key, &PROJECT).unwrap().data, b"os");
     assert!(next.store.io.bytes[h.log_offset..].iter().all(|b| *b == 0));
     let config = next.store.config();
-    assert_eq!(config.partition_guid, PROJECT);
+    assert_eq!(config.backing.store_uuid, PROJECT);
+    assert_eq!(config.backing.partition_uuid, PROJECT);
+    assert_eq!(config.backing.kind, efvs::BackingKind::Partition);
     assert_eq!(config.posture_tier, 0);
     assert_eq!(config.anchor_value, 0);
     assert_eq!(
@@ -704,7 +706,7 @@ fn failed_boot_compaction_does_not_lock_or_publish_an_anchor() {
             size: 64 * 1024,
             checkpoint_capacity: 16 * 1024,
             write_unit: 4096,
-            partition_guid: PROJECT,
+            backing: efvs::BackingDescriptor::partition(PROJECT, PROJECT, 64 * 1024, 4096).unwrap(),
         },
         efvs::PolicyNone,
         &mut anchor,

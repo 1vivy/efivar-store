@@ -3,17 +3,17 @@ use crate::variables::{Error, MAX_NAME};
 use alloc::{vec, vec::Vec};
 use efivar_store::{efvs, persist};
 
-/// The partition geometry the consumer asks the store to adopt.
+/// The backing geometry and identity the consumer asks the store to adopt.
 #[derive(Clone, Copy)]
 pub struct Manifest {
-    /// Partition size in bytes.
+    /// Partition or file image size in bytes.
     pub size: usize,
     /// Capacity of each of the two checkpoint slots.
     pub checkpoint_capacity: usize,
     /// At least the device's physical write unit, not merely its logical sector.
     pub write_unit: usize,
-    /// GUID the consumer assigned to this partition.
-    pub partition_guid: efvs::Guid,
+    /// Exact selected backing and its stable store identity.
+    pub backing: efvs::BackingDescriptor,
 }
 
 /// Boot-time diagnostic snapshot; this exposes no mutable bytes or alternate I/O path.
@@ -93,6 +93,12 @@ impl<I: Storage, V: efvs::Verifier> Efvs<I, V> {
         if manifest.write_unit == 0 || !manifest.write_unit.is_power_of_two() {
             return Err(Error::InvalidParameter);
         }
+        if manifest.backing.store_size != manifest.size as u64
+            || manifest.backing.write_unit != manifest.write_unit as u32
+        {
+            return Err(Error::InvalidParameter);
+        }
+        manifest.backing.validate().map_err(format_error)?;
         crate::migration::prepare(&mut io, &mut image, manifest)?;
         let header = efvs::Header::decode(&image).map_err(format_error)?;
         if manifest.write_unit == 0
@@ -116,7 +122,7 @@ impl<I: Storage, V: efvs::Verifier> Efvs<I, V> {
         efvs::commit_anchor(anchor, count).map_err(format_error)?;
         let anchor_value = anchor.read().map_err(format_error)?;
         let config = efvs::ConfigTable {
-            partition_guid: manifest.partition_guid,
+            backing: manifest.backing,
             posture_tier: efvs::posture_tier(anchor.capabilities()),
             anchor_value,
             capabilities: anchor.capabilities(),

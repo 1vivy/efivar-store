@@ -121,6 +121,15 @@ if you do not, the OS must boot with physical addressing.
 
 ## 6. Using this crate as the storage engine
 
+- Choose and validate the backing before installing the service. A file-backed
+  store is external configuration (`EFI/EFVS/store.cfg`) plus a fixed-size EFVS
+  image; a partition-backed store normally uses its own unique partition UUID as
+  the store UUID. Decode the descriptor with `efvs::BackingDescriptor`, compare
+  the complete descriptor when adopting an existing `ConfigTable`, and treat a
+  missing target, invalid descriptor or identity mismatch as fatal when a
+  selection exists. Only an absent descriptor may fall back to unique-partition
+  discovery. The descriptor is unauthenticated configuration: it chooses a
+  location, not an authorization, and does not raise tier 0.
 - Implement `persist::Read`/`Write`/`Flush` for your device (firmware: `BlockIo` with
   `FlushBlocks`; host: `persist::unix::Device`), and let `persist::apply` own the phase order. Copying
   a whole rebuilt image to the device is *not* a crash-safe transaction.

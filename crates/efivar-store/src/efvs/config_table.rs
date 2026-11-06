@@ -7,13 +7,19 @@ pub const CONFIG_TABLE_GUID: Guid = [
 pub const PARTITION_TYPE_GUID: Guid = [
     0xb2, 0x63, 0x76, 0x51, 0xb3, 0x3f, 0x78, 0x4a, 0x9a, 0xbe, 0xc4, 0x55, 0x94, 0x84, 0x8d, 0xd5,
 ];
+/// Wire version of the published configuration table.
+pub const CONFIG_TABLE_VERSION: u16 = 2;
 /// Bytes of one encoded EFVS configuration table.
-pub const CONFIG_TABLE_SIZE: usize = 48;
+pub const CONFIG_TABLE_SIZE: usize = 32 + BACKING_DESCRIPTOR_SIZE;
 /// The EFVS configuration table published in `EFI_CONFIGURATION_TABLE`.
+///
+/// The descriptor binds a running image to the exact backing it opened; the
+/// store identity is the descriptor's `store_uuid`, never a misleading
+/// partition GUID for a file-backed store.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConfigTable {
-    /// GUID of the EFVS partition this table describes.
-    pub partition_guid: Guid,
+    /// Store identity, backing kind, locator and geometry.
+    pub backing: BackingDescriptor,
     /// Provenance posture tier the platform can claim.
     pub posture_tier: u8,
     /// Freshness-anchor value the store was opened with.
@@ -29,6 +35,7 @@ impl ConfigTable {
         {
             return Err(Error::Unsupported);
         }
+        self.backing.validate()?;
         Ok(())
     }
     /// Encode the table into `dst`.
@@ -37,29 +44,30 @@ impl ConfigTable {
         let b = dst.get_mut(..CONFIG_TABLE_SIZE).ok_or(Error::Bounds)?;
         b.fill(0);
         b[..4].copy_from_slice(b"EFVT");
-        b[4..6].copy_from_slice(&VERSION.to_le_bytes());
+        b[4..6].copy_from_slice(&CONFIG_TABLE_VERSION.to_le_bytes());
         b[6..8].copy_from_slice(&(CONFIG_TABLE_SIZE as u16).to_le_bytes());
-        b[8..24].copy_from_slice(&self.partition_guid);
-        b[24] = self.posture_tier;
-        b[28..32].copy_from_slice(&self.capabilities.to_le_bytes());
-        b[32..40].copy_from_slice(&self.anchor_value.to_le_bytes());
+        b[8] = self.posture_tier;
+        b[12..16].copy_from_slice(&self.capabilities.to_le_bytes());
+        b[16..24].copy_from_slice(&self.anchor_value.to_le_bytes());
+        self.backing.encode(&mut b[32..])?;
         Ok(())
     }
-    /// Decode and validate a configuration table.
+    /// Decode and validate a configuration table. Version 1 is rejected rather
+    /// than interpreted with the version 2 layout.
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let b = bytes.get(..CONFIG_TABLE_SIZE).ok_or(Error::Bounds)?;
         if &b[..4] != b"EFVT"
-            || u16_at(b, 4) != VERSION
+            || u16_at(b, 4) != CONFIG_TABLE_VERSION
             || u16_at(b, 6) != CONFIG_TABLE_SIZE as u16
-            || b[25..28].iter().chain(b[40..48].iter()).any(|b| *b != 0)
+            || b[9..12].iter().chain(b[24..32].iter()).any(|b| *b != 0)
         {
             return Err(Error::Header);
         }
         let t = Self {
-            partition_guid: b[8..24].try_into().unwrap(),
-            posture_tier: b[24],
-            capabilities: u32_at(b, 28),
-            anchor_value: u64_at(b, 32),
+            backing: BackingDescriptor::decode(&b[32..])?,
+            posture_tier: b[8],
+            capabilities: u32_at(b, 12),
+            anchor_value: u64_at(b, 16),
         };
         t.validate()?;
         Ok(t)

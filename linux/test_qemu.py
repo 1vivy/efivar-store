@@ -33,13 +33,29 @@ def archive(files: dict[str, tuple[bytes, int]]) -> bytes:
     return bytes(result)
 
 
-def init_script(phase: str, transports: list[str], relocating: bool, loader_args: list[str], partuuid: uuid.UUID | None) -> bytes:
+def init_script(phase: str, transports: list[str], relocating: bool, loader_args: list[str], partuuid: uuid.UUID | None, file_backing: bool = False, builtin_frontend: bool = False) -> bytes:
     loads = "\n".join(f"/bin/busybox insmod /lib/{name} || fail transport-{name}" for name in transports)
     loader = "/bin/relocating-insmod" if relocating else "/bin/busybox insmod"
     if relocating:
         loader += "".join(" " + shlex.quote(argument) for argument in loader_args)
+    frontend = "" if builtin_frontend else f"{loader} /lib/efivarfs.ko || fail frontend-insertion"
     selector = 'dev="$dev"' if partuuid is None else "partuuid=" + str(
         uuid.uuid5(partuuid, "missing") if phase == "missing" else partuuid)
+    file_setup = ""
+    file_claim = ""
+    if file_backing:
+        selector = "path=/esp/store.efvs"
+        file_setup = f"""
+/bin/busybox mkdir -p /esp
+/bin/busybox mount -t vfat /dev/vda /esp || fail backing-mount
+{loader} /lib/efivar_store.ko path=/esp/store.efvs dev="$dev" && fail selectors-accepted
+{loader} /lib/efivar_store.ko path=/esp/missing.efvs && fail missing-file-accepted
+/bin/busybox ln -s /esp/store.efvs /store-link
+{loader} /lib/efivar_store.ko path=/store-link && fail symlink-accepted
+"""
+        file_claim = """
+/bin/busybox flock -n /esp/store.efvs /bin/busybox true && fail exclusive-claim
+"""
     refusal = f"""
 {loader} /lib/efivar_store.ko {selector} && fail {phase}-accepted
 /bin/busybox test ! -d /sys/module/efivar_store || fail rejected-backend-present
@@ -50,8 +66,11 @@ shutdown
 /bin/busybox printf '\007\000\000\000first' > "$keep" || fail set
 /bin/busybox printf '\007\000\000\000first' > /expected
 /bin/busybox cmp /expected "$keep" || fail immediate-get
+# efivarfs protects unknown vendor names with the immutable inode flag.
+/bin/busybox chattr -i "$keep" || fail unlock-update
 /bin/busybox printf '\007\000\000\000second' > "$keep" || fail replace
 /bin/busybox printf '\007\000\000\000gone' > "$deleted" || fail create-delete
+/bin/busybox chattr -i "$deleted" || fail unlock-delete
 /bin/busybox rm "$deleted" || fail delete
 /bin/busybox test ! -e "$deleted" || fail delete-visible
 """ if phase == "write" else r"""
@@ -74,9 +93,11 @@ exec >/dev/kmsg 2>&1
 dev=$(/bin/busybox cat /sys/class/block/vda/dev)
 major=${{dev%:*}}; minor=${{dev#*:}}
 /bin/busybox mknod /dev/vda b "$major" "$minor" || fail block-node
-{loader} /lib/efivarfs.ko || fail frontend-insertion
+{frontend}
+{file_setup}
 {refusal}
 {loader} /lib/efivar_store.ko {selector} || fail backend-insertion
+{file_claim}
 /bin/busybox mount -t efivarfs -o rw efivarfs /efivars || fail mount-rw
 keep=/efivars/Roundtrip-{GUID}
 deleted=/efivars/Deleted-{GUID}
@@ -92,18 +113,23 @@ def main() -> None:
     parser.add_argument("--kernel-out", type=Path, required=True)
     parser.add_argument("--arch", choices=("aarch64", "x86_64"), default="aarch64")
     parser.add_argument("--backend", type=Path, required=True)
-    parser.add_argument("--frontend", type=Path, required=True)
+    parser.add_argument("--frontend", type=Path, help="efivarfs module; omit when built into the kernel")
     parser.add_argument("--busybox", type=Path, required=True)
     parser.add_argument("--cli", type=Path, required=True)
     parser.add_argument("--work", type=Path)
     parser.add_argument("--loader", type=Path, help="Static relocating module loader for trimmed GKI")
     parser.add_argument("--loader-arg", action="append", default=[], help="Argument preceding the module path; the egysk lkm-loader takes MODULE [PARAMS] directly and needs none")
     parser.add_argument("--partuuid", type=uuid.UUID, help="Exercise GPT partition selection, including missing and duplicate UUID refusal; requires sfdisk")
+    parser.add_argument("--file", action="store_true", help="Exercise a regular EFVS file on a guest FAT volume; requires mtools")
     args = parser.parse_args()
     if args.loader_arg and not args.loader:
         parser.error("--loader-arg requires --loader")
     if args.partuuid and not shutil.which("sfdisk"):
         parser.error("--partuuid requires sfdisk")
+    if args.file and args.partuuid:
+        parser.error("--file and --partuuid are mutually exclusive")
+    if args.file and (not shutil.which("mformat") or not shutil.which("mcopy")):
+        parser.error("--file requires mformat and mcopy")
     work = args.work or Path(tempfile.mkdtemp(prefix="efivar-qemu-", dir="/var/tmp"))
     if args.work:
         work.mkdir(parents=True, exist_ok=False)
@@ -111,12 +137,16 @@ def main() -> None:
     subprocess.run([str(args.cli.resolve()), "init", "--efvs", "--image", str(image), "--size", "1048576"], check=True)
     files = {"bin": (b"", stat.S_IFDIR | 0o755), "lib": (b"", stat.S_IFDIR | 0o755),
              "bin/busybox": (args.busybox.read_bytes(), stat.S_IFREG | 0o755),
-             "lib/efivar_store.ko": (args.backend.read_bytes(), stat.S_IFREG | 0o644),
-             "lib/efivarfs.ko": (args.frontend.read_bytes(), stat.S_IFREG | 0o644)}
+             "lib/efivar_store.ko": (args.backend.read_bytes(), stat.S_IFREG | 0o644)}
+    if args.frontend:
+        files["lib/efivarfs.ko"] = (args.frontend.read_bytes(), stat.S_IFREG | 0o644)
     if args.loader:
         files["bin/relocating-insmod"] = (args.loader.read_bytes(), stat.S_IFREG | 0o755)
     transports = []
-    for relative in ["drivers/virtio/virtio_pci_legacy_dev.ko", "drivers/virtio/virtio_pci_modern_dev.ko", "drivers/virtio/virtio_pci.ko", "drivers/block/virtio_blk.ko"]:
+    modules = ["drivers/virtio/virtio_pci_legacy_dev.ko", "drivers/virtio/virtio_pci_modern_dev.ko", "drivers/virtio/virtio_pci.ko", "drivers/block/virtio_blk.ko"]
+    if args.file:
+        modules += ["fs/nls/nls_cp437.ko", "fs/nls/nls_iso8859-1.ko", "fs/fat/fat.ko", "fs/fat/vfat.ko"]
+    for relative in modules:
         path = args.kernel_out / relative
         if path.exists():
             files[f"lib/{path.name}"] = (path.read_bytes(), stat.S_IFREG | 0o644)
@@ -148,12 +178,19 @@ def main() -> None:
             # Truncate the last record's bytes, retaining the fixed block-device size.
             raw[log_offset + length - 16:] = bytes(len(raw) - log_offset - length + 16)
             image.write_bytes(raw)
-        files["init"] = (init_script(phase, transports, args.loader is not None, args.loader_arg, args.partuuid), stat.S_IFREG | 0o755)
+        files["init"] = (init_script(phase, transports, args.loader is not None, args.loader_arg, args.partuuid, args.file, args.frontend is None), stat.S_IFREG | 0o755)
         initrd = work / f"{phase}.cpio"
         initrd.write_bytes(archive(files))
         disk = image
         offset = 1048576
         size = image.stat().st_size
+        if args.file:
+            disk = work / f"{phase}-fat.img"
+            with disk.open("xb") as output:
+                output.truncate(16 * 1024 * 1024)
+            subprocess.run(["mformat", "-i", str(disk), "::"], check=True)
+            subprocess.run(["mcopy", "-i", str(disk), str(image), "::store.efvs"], check=True)
+        before_store = image.read_bytes()
         if args.partuuid:
             disk = work / f"{phase}-gpt.img"
             with disk.open("xb") as output:
@@ -167,7 +204,7 @@ def main() -> None:
         before = disk.read_bytes()
         command = [qemu, "-machine", "q35" if x86 else "virt", "-cpu", "max", "-m", "1024", "-smp", "2", "-nographic", "-no-reboot",
                    "-kernel", str(kernel), "-initrd", str(initrd),
-                   "-append", f"{console} rdinit=/init panic=-1 nokaslr",
+                   "-append", f"{console} rdinit=/init panic=-1 nokaslr loglevel=8",
                    "-drive", f"if=none,file={disk},format=raw,id=store", "-device", "virtio-blk-pci,drive=store"]
         if phase == "duplicate":
             duplicate = work / "duplicate-second.img"
@@ -188,7 +225,14 @@ def main() -> None:
             print(text.decode(errors="replace"))
             raise SystemExit(f"VM {phase} gate failed; exact console evidence: {log}")
         after = disk.read_bytes()
-        if phase in ("blank", "missing", "duplicate") and after != before:
+        if args.file:
+            extracted = work / f"{phase}-after.efvs"
+            subprocess.run(["mcopy", "-i", str(disk), "::store.efvs", str(extracted)], check=True)
+            after_store = extracted.read_bytes()
+            if phase == "blank" and after_store != before_store:
+                raise SystemExit("Rejected blank file was modified by the kernel")
+            image.write_bytes(after_store)
+        if not args.file and phase in ("blank", "missing", "duplicate") and after != before:
             raise SystemExit(f"Rejected {phase} store was modified by the kernel")
         if phase == "duplicate" and duplicate.read_bytes() != before:
             raise SystemExit("Rejected duplicate store was modified by the kernel")
@@ -199,6 +243,8 @@ def main() -> None:
     print(f"PASS: immediate read, update, delete, reboot, firmware compaction, torn-tail reread and blank refusal without writes; image: {work / 'store.img'}")
     if args.partuuid:
         print("PASS: PARTUUID selection, missing and duplicate refusal without writes, and partition write boundaries")
+    if args.file:
+        print("PASS: FAT file backing, exclusive claim, and conflicting selector, missing file and symlink refusal")
 
 
 if __name__ == "__main__":

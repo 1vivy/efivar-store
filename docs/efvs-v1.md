@@ -19,9 +19,10 @@ Generated with `uuidgen` for this format freeze:
 
 Format identity is `EFVS` magic plus version, **not** a GPT type. Existing bdsvars
 partitions retain their type and require no GPT change. The configuration table
-contains the partition's **unique instance GUID**, not its type GUID. GUID fields
-use EFI mixed-endian wire order: first u32/u16/u16 little endian, last eight bytes
-in displayed order. Integers below are unsigned little endian unless stated.
+contains a backing descriptor: the store's own UUID, the partition or file
+locator, and the exact geometry. GUID fields use EFI mixed-endian wire order:
+first u32/u16/u16 little endian, last eight bytes in displayed order. Integers
+below are unsigned little endian unless stated.
 Offsets are bytes. No native-structure casts, pointers, compiler padding, or host
 endianness are used. All regions and records are 8-byte aligned. All unused bytes,
 reserved fields and padding are zero. Unknown versions/flags are refused, never
@@ -285,23 +286,63 @@ an additive v1 profile without changing the base geometry. Present decoders reje
 all nonzero reserved fields: support must be explicitly negotiated/implemented,
 not silently enabled. No untrusted provenance flag can raise the posture tier.
 
-## Configuration table (48 bytes)
+## Backing selection descriptor (320 bytes)
+
+`EFI/EFVS/store.cfg` on the selected ESP is external configuration, not part of
+the EFVS image. `\EFI\EFVS\store.cfg` is the same object through UEFI file
+protocols. It selects exactly one backing object:
+
+| Offset | Width | Field |
+| --- | --- | --- |
+| 0 | 4 | ASCII `EFVB` |
+| 4 | 2 | descriptor version = 1 |
+| 6 | 2 | descriptor length = 320 |
+| 8 | 1 | kind: 1 = whole partition, 2 = file below the ESP |
+| 9 | 7 | zero |
+| 16 | 16 | store UUID, independent of the locator |
+| 32 | 16 | partition UUID; for a file, the containing ESP partition UUID |
+| 48 | 8 | exact store image size in bytes |
+| 56 | 4 | write unit in bytes (power of two, 512..65536) |
+| 60 | 2 | path length, zero for a partition |
+| 62 | 2 | zero |
+| 64 | 256 | canonical volume-relative path, NUL padded |
+
+A file path is nonempty ASCII, `/`-separated, has no leading, trailing or empty
+component, no `.` or `..`, no component ending in `.` (a FAT alias), and no
+backslash, colon or other alternate separator. It must not name
+`EFI/EFVS/store.cfg` in any ASCII case, because that path is the selector
+itself. The store size is a nonzero multiple of the write unit and at most
+`BACKING_MAX_STORE_SIZE` (16 MiB), so a consumer can bound a whole-image read
+before validating a file or partition. UUIDs are nonzero. The file is a fixed
+provisioned-size image; there is no live rename or resize.
+
+A present descriptor is authoritative. A missing target, an invalid descriptor
+or a duplicate identity is an error, never a fallback. Only an absent
+descriptor leaves an existing installation on the unique-partition discovery
+path. The descriptor selects a location and identity; it grants no authorization.
+It is unauthenticated configuration on the same medium as the store, so an
+attacker who can rewrite it can redirect selection within the validated target
+rules. Tier 0 and the policy and posture sections above are unchanged.
+
+## Configuration table (352 bytes)
 
 | Offset | Width | Field |
 | --- | --- | --- |
 | 0 | 4 | ASCII `EFVT` |
-| 4 | 2 | format version = 1 |
-| 6 | 2 | table length = 48 |
-| 8 | 16 | partition unique GUID |
-| 24 | 1 | posture tier = 0 in this implementation |
-| 25 | 3 | zero |
-| 28 | 4 | capability bits |
-| 32 | 8 | current anchor value |
-| 40 | 8 | reserved zero |
+| 4 | 2 | table version = 2 |
+| 6 | 2 | table length = 352 |
+| 8 | 1 | posture tier = 0 in this implementation |
+| 9 | 3 | zero |
+| 12 | 4 | capability bits |
+| 16 | 8 | current anchor value |
+| 24 | 8 | zero |
+| 32 | 320 | backing selection descriptor |
 
 Publish in firmware-owned memory under CONFIG_TABLE_GUID. It contains no pointers;
-byte codecs avoid ABI packing assumptions. Format GUID and partition type GUID
-are different from the per-device partition GUID in this table.
+byte codecs avoid ABI packing assumptions. Version 1 tables are rejected, not
+reinterpreted with this layout. Format GUID and partition type GUID are different
+from the per-device identity in this table. Adoption compares the complete
+descriptor, so a table for another store or another locator is refused.
 
 ## Host tools
 
@@ -310,7 +351,17 @@ efivar-store init --efvs --image vars.img --size 1048576
 efivar-store --image vars.img inspect
 efivar-store --image vars.img set --name BootOrder --guid 8be4df61-93ca-11d2-aa0d-00e098032b8c --attributes 7 --data-file order.bin
 efivar-store --image vars.img compact
+efivar-store backing provision --esp /boot/efi --path EFI/EFVS/store.img --size 1048576 --store-uuid STORE-UUID --esp-uuid ESP-UUID
+efivar-store backing inspect --esp /boot/efi
 ```
+
+`backing provision` writes a fresh fixed-size image and the descriptor, and
+refuses an existing image or selection. `backing select` records an existing
+file or partition, verifies the target size, and refuses an existing selection
+unless `--replace` is explicit. A whole-partition selection additionally requires
+`--device`; file and partition targets are read within the 16 MiB bound and must
+decode as a complete EFVS image with a write unit at least the selection's.
+Neither command formats a partition or migrates a store.
 
 `inspect/list/get/set/delete/oneshot` detect EFVS by header magic; edk2 commands
 remain compatible. EFVS writes lock, reload, append **only the record range**,

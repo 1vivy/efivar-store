@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use efivar_store::efvs::{BackingDescriptor, BackingKind, Header, initialize_with_block};
 use efivar_store::{Guid, Layout, Store, StoreMut};
 
 /// `4a67b082-0a4c-41cf-b6c7-440b29bb8c4f` in on-disk (mixed-endian) GUID order.
@@ -315,6 +316,262 @@ fn inspect_reports_the_true_free_space() {
         inspected.contains(&format!("free space: {free} bytes")),
         "{inspected}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Provisions a fixed-size store and refuses every implicit overwrite or
+/// missing-target selection; partition identity defaults to its own UUID.
+#[test]
+fn backing_provision_and_select_are_explicit_and_never_overwrite() {
+    let dir = std::env::temp_dir().join(format!(
+        "efivar-store-backing-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let esp = dir.join("esp");
+    std::fs::create_dir_all(esp.join("EFI/EFVS")).unwrap();
+    let esp_text = esp.to_str().unwrap();
+    let uuid = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
+    let store_uuid = "11223344-5566-7788-9900-aabbccddeeff";
+    let provision = [
+        "backing",
+        "provision",
+        "--esp",
+        esp_text,
+        "--path",
+        "EFI/EFVS/store.img",
+        "--size",
+        "65536",
+        "--block",
+        "4096",
+        "--checkpoint",
+        "16384",
+        "--store-uuid",
+        store_uuid,
+        "--esp-uuid",
+        uuid,
+    ];
+    let created = ok(&run(&provision));
+    assert!(created.contains("provisioned"), "{created}");
+    assert!(created.contains("selected"), "{created}");
+
+    let config = std::fs::read(esp.join("EFI/EFVS/store.cfg")).unwrap();
+    let descriptor = BackingDescriptor::decode(&config).expect("decoding the selection");
+    assert_eq!(descriptor.kind, BackingKind::File);
+    assert_eq!(descriptor.path(), "EFI/EFVS/store.img");
+    assert_eq!(descriptor.store_size, 65536);
+    assert_eq!(descriptor.write_unit, 4096);
+    let image = std::fs::read(esp.join("EFI/EFVS/store.img")).unwrap();
+    assert_eq!(Header::decode(&image).unwrap().image_size, 65536);
+
+    let inspected = ok(&run(&["backing", "inspect", "--esp", esp_text]));
+    assert!(inspected.contains("kind: file"), "{inspected}");
+    assert!(
+        inspected.contains("path: EFI/EFVS/store.img"),
+        "{inspected}"
+    );
+
+    // A second provision refuses both the existing selection and the store.
+    let refused = run(&provision);
+    assert!(
+        !refused.status.success(),
+        "provision replaced the selection"
+    );
+    assert_eq!(
+        std::fs::read(esp.join("EFI/EFVS/store.cfg")).unwrap(),
+        config
+    );
+    assert_eq!(
+        std::fs::read(esp.join("EFI/EFVS/store.img")).unwrap(),
+        image
+    );
+
+    // Selecting the same file needs an explicit --replace.
+    let select = [
+        "backing",
+        "select",
+        "--esp",
+        esp_text,
+        "--kind",
+        "file",
+        "--path",
+        "EFI/EFVS/store.img",
+        "--size",
+        "65536",
+        "--block",
+        "4096",
+        "--store-uuid",
+        store_uuid,
+        "--esp-uuid",
+        uuid,
+    ];
+    assert!(
+        !run(&select).status.success(),
+        "select replaced the selection"
+    );
+    let mut replacing = select.to_vec();
+    replacing.push("--replace");
+    assert!(run(&replacing).status.success());
+    assert_eq!(
+        BackingDescriptor::decode(&std::fs::read(esp.join("EFI/EFVS/store.cfg")).unwrap()).unwrap(),
+        descriptor
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn backing_selection_rejects_missing_targets_and_partition_identity() {
+    let dir = std::env::temp_dir().join(format!(
+        "efivar-store-backing-reject-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let esp = dir.join("esp");
+    std::fs::create_dir_all(esp.join("EFI/EFVS")).unwrap();
+    let esp_text = esp.to_str().unwrap();
+    let uuid = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
+
+    // A missing file is a failure, and it writes no selection.
+    let missing = run(&[
+        "backing",
+        "select",
+        "--esp",
+        esp_text,
+        "--kind",
+        "file",
+        "--path",
+        "EFI/EFVS/absent.img",
+        "--size",
+        "65536",
+        "--block",
+        "4096",
+        "--store-uuid",
+        uuid,
+        "--esp-uuid",
+        uuid,
+    ]);
+    assert!(!missing.status.success(), "a missing target was selected");
+    assert!(!esp.join("EFI/EFVS/store.cfg").exists());
+
+    // A partition selection must name a same-size device that starts with EFVS.
+    let device = dir.join("partition.img");
+    std::fs::write(&device, vec![0; 65536]).unwrap();
+    let unformatted = run(&[
+        "backing",
+        "select",
+        "--esp",
+        esp_text,
+        "--kind",
+        "partition",
+        "--partition-uuid",
+        uuid,
+        "--size",
+        "65536",
+        "--block",
+        "4096",
+        "--device",
+        device.to_str().unwrap(),
+    ]);
+    assert!(!unformatted.status.success(), "unformatted device selected");
+
+    let mut bytes = vec![0u8; 65536];
+    initialize_with_block(&mut bytes, 16384, 4096).unwrap();
+    std::fs::write(&device, bytes).unwrap();
+    let selected = ok(&run(&[
+        "backing",
+        "select",
+        "--esp",
+        esp_text,
+        "--kind",
+        "partition",
+        "--partition-uuid",
+        uuid,
+        "--size",
+        "65536",
+        "--block",
+        "4096",
+        "--device",
+        device.to_str().unwrap(),
+    ]));
+    assert!(selected.contains("Partition"), "{selected}");
+    let descriptor =
+        BackingDescriptor::decode(&std::fs::read(esp.join("EFI/EFVS/store.cfg")).unwrap()).unwrap();
+    assert_eq!(descriptor.kind, BackingKind::Partition);
+    assert_eq!(descriptor.store_uuid, descriptor.partition_uuid);
+
+    // An unreadable descriptor is a hard inspect failure, not "unconfigured".
+    let mut corrupt = std::fs::read(esp.join("EFI/EFVS/store.cfg")).unwrap();
+    corrupt[0] = b'X';
+    std::fs::write(esp.join("EFI/EFVS/store.cfg"), corrupt).unwrap();
+    assert!(
+        !run(&["backing", "inspect", "--esp", esp_text])
+            .status
+            .success()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn backing_provision_refuses_the_selector_path_case_insensitively() {
+    let dir = std::env::temp_dir().join(format!(
+        "efivar-store-backing-alias-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let esp = dir.join("esp");
+    std::fs::create_dir_all(esp.join("EFI/EFVS")).unwrap();
+    let esp_text = esp.to_str().unwrap();
+    let uuid = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
+    for path in [
+        "EFI/EFVS/store.cfg",
+        "efi/efvs/STORE.CFG",
+        "EFI/EFVS/store.cfg.",
+    ] {
+        let refused = run(&[
+            "backing",
+            "provision",
+            "--esp",
+            esp_text,
+            "--path",
+            path,
+            "--size",
+            "65536",
+            "--block",
+            "4096",
+            "--checkpoint",
+            "16384",
+            "--store-uuid",
+            uuid,
+            "--esp-uuid",
+            uuid,
+        ]);
+        assert!(
+            !refused.status.success(),
+            "provision accepted selector alias {path}"
+        );
+        assert!(!esp.join("EFI/EFVS/store.cfg").exists());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn backing_inspect_reports_unconfigured_without_creating_a_selection() {
+    let dir = std::env::temp_dir().join(format!(
+        "efivar-store-backing-empty-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(dir.join("EFI/EFVS")).unwrap();
+    let inspected = ok(&run(&[
+        "backing",
+        "inspect",
+        "--esp",
+        dir.to_str().unwrap(),
+    ]));
+    assert!(inspected.contains("unconfigured"), "{inspected}");
+    assert!(!dir.join("EFI/EFVS/store.cfg").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

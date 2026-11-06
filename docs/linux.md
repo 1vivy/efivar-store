@@ -21,13 +21,13 @@ memory image/state, returning its changed byte range. While still holding the
 mutex, C performs `kernel_write`, `vfs_fsync`, then chunked readback verification
 of exactly that range. Only then can another reader observe the new state. I/O
 failure rereads the durable image and replays it; failed reload disables all
-callbacks. Linux never formats, imports or compacts. Firmware alone initializes
-blank partitions and compacts exhausted or torn logs.
+callbacks. Linux never formats, imports or compacts. Firmware or offline tooling
+initializes the backing store. Firmware compacts exhausted or torn logs.
 
 Blank/unusable storage is refused with:
 
 ```text
-efivar_store: no usable EFVS store; firmware must initialize blank partitions (no bytes written)
+efivar_store: no usable EFVS store; firmware or offline tooling must initialize blank backing (no bytes written)
 ```
 
 Probe reads bounded header candidates at zero and powers of two from 512 to
@@ -56,8 +56,8 @@ opener credentials are retained by the file and the override API; no private
 credential symbols, provider ABI, `symbol_get` or product/root-runtime dependency
 is involved. Pure in-memory get/next/query/replay need no credential override.
 Initial backing-file open uses the module loader's credentials. Load during
-rdinit before policy, then permit that opener domain access to the backing block
-device through module-owned policy. UID 0 is not a SELinux authorization.
+rdinit before policy, then permit that opener domain access to the selected
+backing through module-owned policy. UID 0 is not a SELinux authorization.
 
 Kernel read/write short counts, fsync errors, verification mismatches and reload
 failures retain their logged operation/result and disable callbacks on failed
@@ -78,9 +78,12 @@ The VM still checks registration, durability and failure/refusal behavior.
 
 ## Discovery and registration
 
-Accept mutually exclusive `dev=major:minor` or `partuuid=<unique-GPT-UUID>`.
-Without parameters, read `/chosen/efivar-store,partuuid` from DT. Mount sysfs at
-`/sys` before loading the module when using either UUID discovery path. Lookup
+Accept mutually exclusive `dev=major:minor`, `partuuid=<unique-GPT-UUID>`, or
+`path=/absolute/path/to/store.efvs`. Without parameters, read
+`/chosen/efivar-store,partuuid` from DT. The module does not mount an ESP or read
+its selection descriptor. The platform resolves that selection before loading
+the module.
+Mount sysfs at `/sys` before loading the module with either UUID discovery path. Lookup
 reads canonical `/sys/class/block/<name>/uevent` entries, matching the exact
 36-character PARTUUID case-insensitively and validating decimal MAJOR/MINOR.
 It requires one match: missing UUID is `ENODEV`, ambiguity is `EEXIST`, malformed
@@ -96,13 +99,32 @@ Recheck the opened partition's UUID before loading bytes, rejecting hotplug
 device-number reuse. Explicit `dev=major:minor` remains independent of sysfs
 UUID enumeration.
 
+`path` opens an existing regular file read-write without following a final
+symlink. It does not create, truncate, resize, or replace the file. The backing
+size must match the EFVS image geometry and cannot exceed 16 MiB.
+The filesystem must already be writable. Keep the same file and mount available
+until the backend is removed.
+
+The file backend takes a nonblocking exclusive inode `flock` for its lifetime.
+An existing cooperative owner prevents module loading. `CONFIG_FILE_LOCKING`
+is required. The final file release removes the claim after callback removal.
+The CLI's exclusive writer lock conflicts with this claim.
+Locks are cooperative, not access control. Do not use the module together with
+direct writers that ignore its claim. A bind mount preserves the underlying
+inode, permissions, and lock identity.
+
+The module remains an optional kernel adapter. maOS uses its userspace adapter
+instead. DKMS builds this module for a selected kernel. It does not establish a
+stable ABI across arbitrary mainline kernels or Android KMI generations.
+
+
 Registration follows `tee_stmm_efi`: unregister generic runtime operations,
 register ours, restore generic operations on registration failure or removal.
 Other registered backends are not evicted. Unregister excludes callbacks before
 freeing buffers. Do not unload with efivarfs mounted.
 
-Android/GBL has no EFI system table, so boot configuration supplies an explicit
-UUID or device selector. Native discovery via the EFVS EFI configuration-table
+Android/GBL has no EFI system table, so platform integration supplies an explicit
+path, UUID, or device selector. Native discovery via the EFVS configuration-table
 GUID remains the **in-tree upstreaming route**:
 ACK's boot-only parser discards unknown GUIDs and releases the table arrays. It
 would need a recognized GUID entry in `efi_config_parse_tables` and retained
@@ -167,8 +189,8 @@ it also needs the `rust-src` component. The `kernel-ffi` CI job explicitly selec
 this nightly with `cargo +nightly-2026-08-08`, because installing it as rustup's
 default does not override the root's stable toolchain file.
 
-The Makefile works both through its outer target and direct ACK kbuild (including
-the egysk pinned-source builder). It builds the staticlib offline with pinned
+The Makefile works through its outer target and direct ACK kbuild.
+It builds the staticlib offline with pinned
 `nightly-2026-08-08`, `-Z build-std=core,compiler_builtins`, and installed `rust-src`;
 no downloaded softfloat target is needed. Override `CARGO`, `EFVS_RUSTC` and
 `RUST_TOOLCHAIN` only with an equivalently supported toolchain. Cargo explicitly
@@ -268,10 +290,10 @@ init_module. It does not itself apply AArch64 relocations: ACK's
 `arch/arm64/kernel/module.c` does.
 Successful CRC/System.map admission alone is not a runtime proof.
 
-The phone has efivarfs disabled in its kernel. The independent LKM product ships
-`fs/efivarfs` as `efivarfs.ko`, with its named patch adding project GUID
-`7a5e4b1c-0d3f-4e62-9b8a-1c2d3e4f5a6b` to the removable allowlist. Load the backend
-before mounting it; unknown GUIDs otherwise need CAP_LINUX_IMMUTABLE for deletion.
+The frontend can be built into the kernel or supplied as `efivarfs.ko`.
+Load the backend before mounting efivarfs. Linux protects unknown vendor names
+with the immutable inode flag. Authorized update or deletion can require
+`chattr -i`; this frontend policy is separate from EFVS variable policy.
 
 ## Exercised build targets (2026-10-09)
 
@@ -323,6 +345,16 @@ The explicit UUID above names a **new disposable GPT fixture**, not a physical
 device or product default. `--partuuid` requires `sfdisk`, wraps the initialized
 EFVS image in a real GPT partition, and boots it through the kernel partition
 parser. Omit it to exercise the explicit `dev=major:minor` path.
+
+Use `--file` instead of `--partuuid` to place the store in a guest FAT volume.
+This mode requires `mformat` and `mcopy` on the host.
+It checks set, update, delete, reboot, compaction, torn-tail recovery, and blank
+refusal through the file backend. It also checks the exclusive claim and refuses
+conflicting selectors, missing files, and final symlinks.
+The guest kernel must support FAT. When FAT is modular, provide its modules under
+`--kernel-out` at their normal build paths. Omit `--frontend` when efivarfs is
+built into the kernel.
+
 
 For x86_64 use `--arch x86_64` and matching x86 inputs. The test kernel needs
 SysRq support: the guest syncs and requests reboot through `/proc/sysrq-trigger`;

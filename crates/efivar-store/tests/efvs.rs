@@ -50,8 +50,10 @@ fn codecs_and_phone_geometry() {
     let mut header = [0; 64];
     h.encode(&mut header).unwrap();
     assert_eq!(&image[..64], &header);
+    let backing =
+        BackingDescriptor::file([7; 16], [9; 16], 4096, 512, "EFI/EFVS/store.img").unwrap();
     let table = ConfigTable {
-        partition_guid: [9; 16],
+        backing,
         posture_tier: 0,
         anchor_value: 42,
         capabilities: CAP_NONE,
@@ -417,6 +419,186 @@ fn malformed_headers_checkpoints_and_zero_auth_time_fail_closed() {
     request.attributes = 0x67;
     state.apply(request, &mut TestVerifier).unwrap();
     assert_eq!(state.get(&n, &[1; 16]).unwrap().data, b"value");
+}
+
+#[test]
+fn backing_descriptor_roundtrips_both_kinds_and_bounds_paths() {
+    let partition = BackingDescriptor::partition([1; 16], [2; 16], 64 * 1024, 4096).unwrap();
+    assert_eq!(partition.path(), "");
+    let mut wire = [0; BACKING_DESCRIPTOR_SIZE];
+    partition.encode(&mut wire).unwrap();
+    assert_eq!(&wire[..4], b"EFVB");
+    assert_eq!(BackingDescriptor::decode(&wire).unwrap(), partition);
+
+    let path = "EFI/EFVS/efvs-store.img";
+    let file = BackingDescriptor::file([3; 16], [4; 16], 128 * 1024, 4096, path).unwrap();
+    assert_eq!(file.kind, BackingKind::File);
+    assert_eq!(file.path(), path);
+    file.encode(&mut wire).unwrap();
+    assert_eq!(BackingDescriptor::decode(&wire).unwrap(), file);
+    assert_ne!(file, partition);
+
+    let longest = format!("{}/{}", "a".repeat(127), "b".repeat(127));
+    assert_eq!(longest.len(), 255);
+    assert!(BackingDescriptor::file([3; 16], [4; 16], 4096, 512, &longest).is_ok());
+    let too_long = format!("{longest}/c");
+    assert_eq!(
+        BackingDescriptor::file([3; 16], [4; 16], 4096, 512, &too_long),
+        Err(Error::InvalidParameter)
+    );
+}
+
+#[test]
+fn backing_descriptor_rejects_noncanonical_paths_and_wire_corruption() {
+    for path in [
+        "",
+        "/EFI/EFVS/store.img",
+        "EFI/EFVS/store.img/",
+        "EFI//EFVS/store.img",
+        "EFI/./store.img",
+        "EFI/../store.img",
+        "EFI\\EFVS\\store.img",
+        "EFI:EFVS",
+        "EFI/EFVS/store img",
+        "EFI/EFVS/\u{00e9}",
+        "EFI/EFVS/store.cfg",
+        "efi/efvs/STORE.CFG",
+        "EFI/EFVS/store.cfg.",
+        "EFI./EFVS/store.img",
+    ] {
+        assert_eq!(
+            BackingDescriptor::file([3; 16], [4; 16], 4096, 512, path),
+            Err(Error::InvalidParameter),
+            "{path:?}"
+        );
+    }
+    assert!(BackingDescriptor::file([3; 16], [4; 16], 4096, 512, "EFI/EFVS/store.cfg.bak").is_ok());
+    let max = BACKING_MAX_STORE_SIZE;
+    assert!(BackingDescriptor::file([3; 16], [4; 16], max, 4096, "EFI/EFVS/store.img").is_ok());
+    assert_eq!(
+        BackingDescriptor::file([3; 16], [4; 16], max + 4096, 4096, "EFI/EFVS/store.img"),
+        Err(Error::InvalidParameter)
+    );
+    assert_eq!(
+        BackingDescriptor::file([0; 16], [4; 16], 4096, 512, "EFI/EFVS/store.img"),
+        Err(Error::InvalidParameter)
+    );
+    assert_eq!(
+        BackingDescriptor::file([3; 16], [0; 16], 4096, 512, "EFI/EFVS/store.img"),
+        Err(Error::InvalidParameter)
+    );
+    assert_eq!(
+        BackingDescriptor::partition([1; 16], [2; 16], 4097, 4096),
+        Err(Error::InvalidParameter)
+    );
+    assert_eq!(
+        BackingDescriptor::partition([1; 16], [2; 16], 5000, 1024),
+        Err(Error::InvalidParameter)
+    );
+    assert_eq!(
+        BackingDescriptor::partition([1; 16], [2; 16], 4096, 0),
+        Err(Error::InvalidParameter)
+    );
+
+    let descriptor =
+        BackingDescriptor::file([3; 16], [4; 16], 64 * 1024, 4096, "EFI/EFVS/store.img").unwrap();
+    let mut wire = [0; BACKING_DESCRIPTOR_SIZE];
+    descriptor.encode(&mut wire).unwrap();
+    assert_eq!(BackingDescriptor::decode(&wire[..319]), Err(Error::Bounds));
+
+    let mut bad_version = wire;
+    bad_version[4] = 2;
+    assert_eq!(BackingDescriptor::decode(&bad_version), Err(Error::Header));
+    let mut bad_kind = wire;
+    bad_kind[8] = 3;
+    assert_eq!(BackingDescriptor::decode(&bad_kind), Err(Error::Header));
+    let mut reserved = wire;
+    reserved[10] = 1;
+    assert_eq!(BackingDescriptor::decode(&reserved), Err(Error::Header));
+    let mut trailing = wire;
+    let len = descriptor.path().len();
+    trailing[64 + len] = b'x';
+    assert_eq!(BackingDescriptor::decode(&trailing), Err(Error::Header));
+    let mut noncanonical = wire;
+    noncanonical[64..64 + len].fill(0);
+    noncanonical[64..79].copy_from_slice(b"EFI/../evfs.img");
+    noncanonical[60..62].copy_from_slice(&15u16.to_le_bytes());
+    assert_eq!(
+        BackingDescriptor::decode(&noncanonical),
+        Err(Error::InvalidParameter)
+    );
+
+    let partition_wire_start = {
+        let mut bytes = [0; BACKING_DESCRIPTOR_SIZE];
+        BackingDescriptor::partition([1; 16], [2; 16], 4096, 512)
+            .unwrap()
+            .encode(&mut bytes)
+            .unwrap();
+        bytes
+    };
+    let mut partition_with_path = partition_wire_start;
+    partition_with_path[60..62].copy_from_slice(&1u16.to_le_bytes());
+    partition_with_path[64] = b'x';
+    assert_eq!(
+        BackingDescriptor::decode(&partition_with_path),
+        Err(Error::InvalidParameter)
+    );
+}
+
+#[test]
+fn config_table_v2_binds_backing_and_rejects_previous_version() {
+    let backing =
+        BackingDescriptor::file([5; 16], [6; 16], 64 * 1024, 4096, "EFI/EFVS/store.img").unwrap();
+    let table = ConfigTable {
+        backing,
+        posture_tier: 0,
+        anchor_value: 9,
+        capabilities: CAP_NONE,
+    };
+    let mut wire = [0; CONFIG_TABLE_SIZE];
+    table.encode(&mut wire).unwrap();
+    assert_eq!(&wire[..4], b"EFVT");
+    assert_eq!(u16::from_le_bytes(wire[4..6].try_into().unwrap()), 2);
+    assert_eq!(ConfigTable::decode(&wire).unwrap(), table);
+
+    let mut old = wire;
+    old[4..6].copy_from_slice(&1u16.to_le_bytes());
+    assert_eq!(ConfigTable::decode(&old), Err(Error::Header));
+    let mut short = wire;
+    short[6..8].copy_from_slice(&48u16.to_le_bytes());
+    assert_eq!(ConfigTable::decode(&short), Err(Error::Header));
+    let mut other = wire;
+    let mut other_backing = [0; BACKING_DESCRIPTOR_SIZE];
+    BackingDescriptor::file([5; 16], [6; 16], 64 * 1024, 4096, "EFI/EFVS/other.img")
+        .unwrap()
+        .encode(&mut other_backing)
+        .unwrap();
+    other[32..].copy_from_slice(&other_backing);
+    assert_ne!(ConfigTable::decode(&other).unwrap().backing, backing);
+}
+
+#[test]
+fn config_table_keeps_posture_claims_bounded() {
+    let backing = BackingDescriptor::partition([1; 16], [1; 16], 64 * 1024, 4096).unwrap();
+    let table = |posture_tier, capabilities| ConfigTable {
+        backing,
+        posture_tier,
+        anchor_value: 0,
+        capabilities,
+    };
+    let mut wire = [0; CONFIG_TABLE_SIZE];
+    assert_eq!(
+        table(1, CAP_NONE).encode(&mut wire),
+        Err(Error::Unsupported)
+    );
+    assert_eq!(
+        table(0, CAP_RUNTIME_BUMP).encode(&mut wire),
+        Err(Error::Unsupported)
+    );
+    assert_eq!(table(0, 4).encode(&mut wire), Err(Error::Unsupported));
+    // Monotonic capability alone is representable but cannot raise the tier.
+    table(0, CAP_MONOTONIC).encode(&mut wire).unwrap();
+    assert_eq!(ConfigTable::decode(&wire).unwrap().posture_tier, 0);
 }
 
 #[test]

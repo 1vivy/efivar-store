@@ -22,7 +22,9 @@ The 1 MiB phone profile reserves two 128 KiB checkpoint slots and a 778240-byte 
 3. **[Linux backend](docs/linux.md)** (`linux/`): a C-glue efivars module linking the
    allocation-free Rust engine through `crates/efivar-store-ffi`. It serves the kernel's
    own efivarfs without kernel Rust crates or Rust-mangled imports.
-4. **CLI** (`cli`): inspect and edit image files and caller-selected block devices.
+4. **CLI** (`cli`): inspect and edit image files and caller-selected block devices,
+   provision a fixed-size file-backed EFVS store, and record or inspect the explicit
+   ESP backing selection.
 
 The official Secure Boot policy is **None**: no root keys, SecureBoot=0, tier 0.
 Authenticated writes are refused, not silently accepted by a crypto stub.
@@ -77,6 +79,8 @@ Tier 0 under Policy None does **not** claim authenticated integrity.
   selection precedence (`OneShot` > `Default` > `Selected`). Consumers own all of it.
 - **Partitioning**: partition names, sizes, GPT or LVM layout, block-device discovery, provisioning of
   the medium. The store is GUID- and size-agnostic: the caller chooses the bytes and the geometry.
+  The shared crate owns the versioned `EFI/EFVS/store.cfg` descriptor codec and the configuration
+  table binding; publishing the selected endpoint remains platform code.
 
 ## Three representations
 
@@ -156,6 +160,10 @@ cargo run --locked -p efivar-store-cli -- --image store.img list
 cargo run --locked -p efivar-store-cli -- --image store.img oneshot linux.conf
 cargo run --locked -p efivar-store-cli -- --image store.img delete \
     --name LoaderEntryDefault --guid 4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+cargo run --locked -p efivar-store-cli -- backing provision --esp /boot/efi \
+    --path EFI/EFVS/store.img --size 1048576 \
+    --store-uuid STORE-UUID --esp-uuid ESP-UUID
+cargo run --locked -p efivar-store-cli -- backing inspect --esp /boot/efi
 ```
 
 `--efvs` selects the live container; omit it for an edk2 interoperability FV.

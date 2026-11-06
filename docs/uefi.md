@@ -7,8 +7,9 @@ allocation-free. The sole UEFI ABI dependency is `r-efi = 6.0.0`, resolved offli
 
 ## Lifecycle: manifest → install → EBS → runtime
 
-1. **Manifest (consumer).** Discover and validate the partition. Supply `backend::Manifest`
-   (size, initial checkpoint capacity, physical write unit, unique GPT GUID), a
+1. **Manifest (consumer).** Discover and validate the selected backing. Supply
+   `backend::Manifest` (size, initial checkpoint capacity, physical write unit, and
+   the `efvs::BackingDescriptor` naming store identity and locator), a
    `service::BlockBackend` implementing `backend::Storage` (primary `Read`/`Write`/`Flush`),
    a namespace `Policy`, a verifier and anchor. Project/BLI GUIDs, size, logging and
    trail marks are consumer policy.
@@ -25,8 +26,9 @@ allocation-free. The sole UEFI ABI dependency is `r-efi = 6.0.0`, resolved offli
    The library captures bounded original-firmware RT variables, prepares the runtime index,
    copies/seals the runtime readers, installs a private gRT and refreshes CRCs. It publishes
    `EFI_RT_PROPERTIES_TABLE` and a runtime-owned EFVS configuration table under
-   `930e89ed-540e-4af0-9b41-c2c559939d50` (unique partition GUID, tier 0, capabilities,
-   committed anchor value), and corrects copied-code execute attributes.
+   `930e89ed-540e-4af0-9b41-c2c559939d50` (backing descriptor with store UUID,
+   kind, locator and geometry; tier 0; capabilities; committed anchor value), and
+   corrects copied-code execute attributes.
 3. **Boot-services operation.** Every downstream consumer uses ordinary gRT
    GetVariable/GetNextVariableName/SetVariable/QueryVariableInfo, not raw image access.
    Managed NV|BS|RT updates append checked EFVS SET/APPEND/DELETE records, flush and read
@@ -101,13 +103,16 @@ the selection precedes both. `VariableService::install` uses the GUID policy onl
 
 ## OS discovery
 
-The EFVS table describes the store to EFI consumers. An out-of-tree Linux module cannot
-depend on an unknown EFI configuration table surviving kernel initialization. Consumers
-such as Surfacer additionally publish `/chosen/efivar-store,partuuid` as a NUL-terminated
-canonical lowercase unique GPT GUID through their DT fixup path. This is consumer
-publishing policy; both the GBL Android DT and native EFI_DT_FIXUP path need it. The Linux
-backend uses the kernel's efivars/efivarfs machinery; it does not modify the frozen EFI
-runtime index.
+The EFVS table describes the store to EFI consumers through its backing
+descriptor. An out-of-tree Linux module cannot depend on an unknown EFI
+configuration table surviving kernel initialization. Consumers such as Surfacer
+additionally publish `/chosen/efivar-store,partuuid` as a NUL-terminated
+canonical lowercase unique GPT GUID through their DT fixup path for the default
+partition selection. This is consumer publishing policy; both the GBL Android DT
+and native EFI_DT_FIXUP path need it. An explicit `EFI/EFVS/store.cfg` selection
+is read from the ESP before that endpoint is published; it never silently falls
+back to the DT GUID when present but invalid. The Linux backend uses the kernel's
+efivars/efivarfs machinery; it does not modify the frozen EFI runtime index.
 
 ## Physical runtime, not virtual relocation
 
