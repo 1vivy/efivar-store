@@ -5,7 +5,7 @@
 //! Direct-partition OS writes leave the already-frozen runtime view stale until reboot.
 use crate::backend::Manifest;
 use crate::variables::{self as logic, Service, index, runtime};
-use alloc::{boxed::Box, vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 use core::{
     ffi::c_void,
     ptr::{self, NonNull, addr_of, addr_of_mut},
@@ -96,6 +96,34 @@ pub struct VariableService {
     config_table: Option<config_table::Publication>,
     attributes: Option<attributes::Correction>,
 }
+/// Chooses the global-name policy from the opened store before the capture.
+///
+/// A caller may keep its policy in the store itself, and the store is only
+/// readable after it is open. [`VariableService::install_with_names`] calls a
+/// closure over this view once the store is open and before the firmware
+/// namespace is captured, so a selection made here applies to the snapshot and
+/// to every later read.
+pub trait NameSelection {
+    /// Reads one stored value of one namespace, or `None` when it is absent or
+    /// unreadable. An unreadable value is not a reason to refuse the install.
+    fn value(&mut self, name: &[u16], guid: &[u8; 16]) -> Option<Vec<u8>>;
+    /// Applies the name-aware routing decision every later read uses.
+    fn select(&mut self, policy: logic::NamePolicy);
+}
+
+/// A [`NameSelection`] over the service this installation just opened.
+struct Selection<'a> {
+    service: &'a mut Service<Backend, firmware::Original, Verifier>,
+}
+impl NameSelection for Selection<'_> {
+    fn value(&mut self, name: &[u16], guid: &[u8; 16]) -> Option<Vec<u8>> {
+        self.service.store.get(name, guid).ok().map(|value| value.1.to_vec())
+    }
+    fn select(&mut self, policy: logic::NamePolicy) {
+        self.service.select_names(Some(policy));
+    }
+}
+
 impl VariableService {
     /// Install over a live system table with caller-selected backend, size and policy.
     /// Serialize boot-services use and retain the owner until restoration before
@@ -110,6 +138,45 @@ impl VariableService {
         anchor: &mut impl efvs::AnchorOps,
         report: fn(mechanism::Report),
     ) -> Result<Self, Status> {
+        Self::install_with_names(table, backend, manifest, policy, verifier, anchor, report, |_| {})
+    }
+
+    /// Install, and choose the global-name policy from the opened store first.
+    ///
+    /// `select` runs after the store is open and before the capture, so a policy
+    /// it applies governs the captured firmware names as well as later reads.
+    /// Every other step matches [`VariableService::install`].
+    // The install inputs are the caller's whole contract: one table, one backend,
+    // one manifest, one policy, one verifier, one anchor, one report and one
+    // selection step. Grouping them into a type would only move the same list.
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_with_names(
+        table: NonNull<efi::SystemTable>,
+        backend: impl BlockBackend + 'static,
+        manifest: Manifest,
+        policy: logic::Policy,
+        verifier: impl efvs::Verifier + 'static,
+        anchor: &mut impl efvs::AnchorOps,
+        report: fn(mechanism::Report),
+        select: impl FnOnce(&mut dyn NameSelection),
+    ) -> Result<Self, Status> {
+        Self::install_inner(table, backend, manifest, policy, verifier, anchor, report, select)
+    }
+
+    // The install inputs are the caller's whole contract: one table, one backend,
+    // one manifest, one policy, one verifier, one anchor, one report and one
+    // selection step. Grouping them into a type would only move the same list.
+    #[allow(clippy::too_many_arguments)]
+    fn install_inner(
+        table: NonNull<efi::SystemTable>,
+        backend: impl BlockBackend + 'static,
+        manifest: Manifest,
+        policy: logic::Policy,
+        verifier: impl efvs::Verifier + 'static,
+        anchor: &mut impl efvs::AnchorOps,
+        report: fn(mechanism::Report),
+        select: impl FnOnce(&mut dyn NameSelection),
+    ) -> Result<Self, Status> {
         if !CONTEXT.load(Ordering::Acquire).is_null() {
             return Err(Status::ALREADY_STARTED);
         }
@@ -117,7 +184,7 @@ impl VariableService {
         let system = unsafe { table.as_ref() };
         let boot = NonNull::new(system.boot_services).ok_or(Status::NOT_READY)?;
         let original = NonNull::new(system.runtime_services).ok_or(Status::NOT_READY)?;
-        let service = Service::open(
+        let mut service = Service::open_uncaptured(
             Backend(Box::new(backend)),
             firmware::Original {
                 table: original,
@@ -129,6 +196,13 @@ impl VariableService {
             anchor,
         )
         .map_err(firmware::status)?;
+        {
+            let mut selection = Selection {
+                service: &mut service,
+            };
+            select(&mut selection);
+        }
+        service.capture().map_err(firmware::status)?;
         let mut snapshot_address = 0;
         // SAFETY: live boot services and writable allocation output.
         let status = unsafe {
