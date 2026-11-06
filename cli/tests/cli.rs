@@ -454,10 +454,12 @@ fn backing_selection_rejects_missing_targets_and_partition_identity() {
     assert!(!missing.status.success(), "a missing target was selected");
     assert!(!esp.join("EFI/EFVS/store.cfg").exists());
 
-    // A partition selection must name a same-size device that starts with EFVS.
+    // A detached image cannot establish the partition identity firmware resolves.
     let device = dir.join("partition.img");
-    std::fs::write(&device, vec![0; 65536]).unwrap();
-    let unformatted = run(&[
+    let mut bytes = vec![0u8; 65536];
+    initialize_with_block(&mut bytes, 16384, 4096).unwrap();
+    std::fs::write(&device, bytes).unwrap();
+    let selected = run(&[
         "backing",
         "select",
         "--esp",
@@ -473,37 +475,15 @@ fn backing_selection_rejects_missing_targets_and_partition_identity() {
         "--device",
         device.to_str().unwrap(),
     ]);
-    assert!(!unformatted.status.success(), "unformatted device selected");
-
-    let mut bytes = vec![0u8; 65536];
-    initialize_with_block(&mut bytes, 16384, 4096).unwrap();
-    std::fs::write(&device, bytes).unwrap();
-    let selected = ok(&run(&[
-        "backing",
-        "select",
-        "--esp",
-        esp_text,
-        "--kind",
-        "partition",
-        "--partition-uuid",
-        uuid,
-        "--size",
-        "65536",
-        "--block",
-        "4096",
-        "--device",
-        device.to_str().unwrap(),
-    ]));
-    assert!(selected.contains("Partition"), "{selected}");
-    let descriptor =
-        BackingDescriptor::decode(&std::fs::read(esp.join("EFI/EFVS/store.cfg")).unwrap()).unwrap();
-    assert_eq!(descriptor.kind, BackingKind::Partition);
-    assert_eq!(descriptor.store_uuid, descriptor.partition_uuid);
+    assert!(
+        !selected.status.success(),
+        "an unverified partition was selected"
+    );
+    assert!(String::from_utf8_lossy(&selected.stderr).contains("verifiable PARTUUID"));
+    assert!(!esp.join("EFI/EFVS/store.cfg").exists());
 
     // An unreadable descriptor is a hard inspect failure, not "unconfigured".
-    let mut corrupt = std::fs::read(esp.join("EFI/EFVS/store.cfg")).unwrap();
-    corrupt[0] = b'X';
-    std::fs::write(esp.join("EFI/EFVS/store.cfg"), corrupt).unwrap();
+    std::fs::write(esp.join("EFI/EFVS/store.cfg"), [b'X'; 320]).unwrap();
     assert!(
         !run(&["backing", "inspect", "--esp", esp_text])
             .status

@@ -5,6 +5,8 @@ use efivar_store::efvs::*;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 fn number(args: &Args, key: &str, default: Option<u64>) -> Result<u64, Failure> {
@@ -173,8 +175,47 @@ fn verify_file(esp: &Path, descriptor: BackingDescriptor) -> Result<PathBuf, Fai
     Ok(target)
 }
 
+/// Bind the inspected device to the UUID that firmware will resolve.
+#[cfg(target_os = "linux")]
+fn verify_partition_identity(file: &File, expected: Guid) -> Result<(), Failure> {
+    let metadata = file.metadata().map_err(fail)?;
+    if !metadata.file_type().is_block_device() {
+        return Err(Failure::Run(
+            "--device must be a block partition with a verifiable PARTUUID".into(),
+        ));
+    }
+    let device = metadata.rdev();
+    let path = format!(
+        "/sys/dev/block/{}:{}/uevent",
+        libc::major(device),
+        libc::minor(device)
+    );
+    let event = fs::read_to_string(&path).map_err(fail)?;
+    let mut identities = event
+        .lines()
+        .filter_map(|line| line.strip_prefix("PARTUUID="));
+    let text = identities
+        .next()
+        .ok_or_else(|| Failure::Run(format!("{path} has no partition UUID")))?;
+    if identities.next().is_some() || guid_from_text(text)? != expected {
+        return Err(Failure::Run(format!(
+            "device PARTUUID {text} does not uniquely match {}",
+            guid_text(&expected)
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_partition_identity(_file: &File, _expected: Guid) -> Result<(), Failure> {
+    Err(Failure::Run(
+        "partition selection requires Linux sysfs identity verification".into(),
+    ))
+}
+
 fn verify_partition(device: &Path, descriptor: BackingDescriptor) -> Result<(), Failure> {
     let mut file = File::open(device).map_err(fail)?;
+    verify_partition_identity(&file, descriptor.partition_uuid)?;
     let len = file.seek(SeekFrom::End(0)).map_err(fail)?;
     if len != descriptor.store_size {
         return Err(Failure::Run(format!(
